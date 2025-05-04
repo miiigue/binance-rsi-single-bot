@@ -32,27 +32,29 @@ def config_to_dict(config: configparser.ConfigParser) -> dict:
     for section in config.sections():
         the_dict[section] = {}
         for key, val in config.items(section):
-            # Intentar convertir a tipos numéricos o booleanos si es posible
-            # Esto es para enviar datos más estructurados al frontend
+            # Intentar convertir tipos
             try:
-                if val.lower() in ['true', 'false']:
+                if section == 'SYMBOLS' and key == 'symbols_to_trade': # Mantener la lista como string
+                    processed_val = val
+                elif val.lower() in ['true', 'false']:
                     processed_val = config.getboolean(section, key)
                 elif '.' in val:
                     processed_val = config.getfloat(section, key)
                 else:
                     processed_val = config.getint(section, key)
             except ValueError:
-                processed_val = val # Mantener como string si no se puede convertir
+                processed_val = val # Mantener como string si no
             the_dict[section][key] = processed_val
     return the_dict
 
-def map_frontend_to_ini(frontend_data: dict) -> dict:
-    """ Mapea las claves del estado de React a la estructura Section/Key del INI """
+def map_frontend_trading_binance(frontend_data: dict) -> dict:
+    """ Mapea solo las claves de [TRADING] y [BINANCE] """
     mapping = {
+        # BINANCE
         'apiKey': ('BINANCE', 'api_key'), 
         'apiSecret': ('BINANCE', 'api_secret'),
         'mode': ('BINANCE', 'mode'),
-        'symbol': ('TRADING', 'symbol'),
+        # TRADING (Excluyendo símbolos)
         'rsiInterval': ('TRADING', 'rsi_interval'),
         'rsiPeriod': ('TRADING', 'rsi_period'),
         'rsiThresholdUp': ('TRADING', 'rsi_threshold_up'),
@@ -62,7 +64,6 @@ def map_frontend_to_ini(frontend_data: dict) -> dict:
         'stopLossUSDT': ('TRADING', 'stop_loss_usdt'),
         'takeProfitUSDT': ('TRADING', 'take_profit_usdt'),
         'cycleSleepSeconds': ('TRADING', 'cycle_sleep_seconds'),
-        # 'active' no se guarda en config.ini
     }
     ini_data = {}
     for frontend_key, value in frontend_data.items():
@@ -70,7 +71,6 @@ def map_frontend_to_ini(frontend_data: dict) -> dict:
             section, ini_key = mapping[frontend_key]
             if section not in ini_data:
                 ini_data[section] = {}
-            # Guardar como string
             processed_value = str(value).lower() if isinstance(value, bool) else str(value)
             ini_data[section][ini_key] = processed_value
     return ini_data
@@ -79,19 +79,30 @@ def map_frontend_to_ini(frontend_data: dict) -> dict:
 
 @app.route('/api/config', methods=['GET'])
 def get_config_endpoint():
-    """Endpoint para obtener la configuración actual de config.ini."""
+    """Endpoint para obtener la configuración actual, incluyendo símbolos."""
     logger = get_logger()
     logger.info("Recibida petición GET /api/config")
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(';', '#'))
     try:
         if not os.path.exists(CONFIG_FILE_PATH):
             logger.error(f"Archivo de configuración no encontrado en {CONFIG_FILE_PATH}")
-            return jsonify({"error": "Config file not found"}), 404
+            # Devolver estructura vacía o valores por defecto si el archivo no existe
+            return jsonify({
+                "BINANCE": {},
+                "TRADING": {},
+                "SYMBOLS": {"symbols_to_trade": ""} # Asegurar que SYMBOLS existe
+            })
         
-        config.read(CONFIG_FILE_PATH)
+        config.read(CONFIG_FILE_PATH, encoding='utf-8')
         config_dict = config_to_dict(config)
-        logger.info("Configuración enviada al frontend.")
-        # logger.debug(f"Config dict: {config_dict}")
+        
+        # Asegurarse de que la sección SYMBOLS y la clave existen en la respuesta
+        if 'SYMBOLS' not in config_dict:
+            config_dict['SYMBOLS'] = {'symbols_to_trade': ''}
+        elif 'symbols_to_trade' not in config_dict['SYMBOLS']:
+            config_dict['SYMBOLS']['symbols_to_trade'] = ''
+            
+        logger.info("Configuración (incluyendo símbolos) enviada al frontend.")
         return jsonify(config_dict)
 
     except Exception as e:
@@ -100,7 +111,7 @@ def get_config_endpoint():
 
 @app.route('/api/config', methods=['POST'])
 def update_config_endpoint():
-    """Endpoint para recibir y guardar la nueva configuración en config.ini."""
+    """Endpoint para recibir y guardar la configuración, incluyendo símbolos."""
     logger = get_logger()
     logger.info("Recibida petición POST /api/config")
     
@@ -115,28 +126,40 @@ def update_config_endpoint():
 
     logger.debug(f"Datos recibidos del frontend: {frontend_data}")
 
-    # Mapear los datos del frontend a la estructura del INI
-    ini_data = map_frontend_to_ini(frontend_data)
+    # 1. Extraer la lista de símbolos del frontend_data
+    symbols_string_raw = frontend_data.get('symbolsToTrade', '') # Usar la clave del estado de React
+    # Limpiar y validar la lista de símbolos
+    symbols_list = [s.strip().upper() for s in symbols_string_raw.split(',') if s.strip()]
+    symbols_to_save = ",".join(symbols_list) # Guardar como string separado por comas
+    logger.debug(f"Símbolos procesados para guardar: {symbols_to_save}")
 
-    config = configparser.ConfigParser()
+    # 2. Mapear los otros parámetros (BINANCE, TRADING)
+    ini_other_data = map_frontend_trading_binance(frontend_data)
+
+    config = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(';', '#'))
     try:
-        # Leer el archivo existente para mantener secciones/claves no enviadas
+        # Leer el archivo existente para mantener secciones no modificadas (ej: LOGGING)
         if os.path.exists(CONFIG_FILE_PATH):
-             config.read(CONFIG_FILE_PATH)
+             config.read(CONFIG_FILE_PATH, encoding='utf-8')
         else:
              logger.warning(f"El archivo {CONFIG_FILE_PATH} no existía, se creará uno nuevo.")
 
-        # Actualizar el objeto config con los nuevos valores
-        for section, keys in ini_data.items():
+        # 3. Actualizar el objeto config con los datos mapeados (BINANCE, TRADING)
+        for section, keys in ini_other_data.items():
             if not config.has_section(section):
                 config.add_section(section)
             for key, value in keys.items():
-                # Asegurarse de que el valor es string antes de escribir
                 config.set(section, key, str(value))
                 logger.debug(f"Actualizando [{section}] {key} = {str(value)}")
+                
+        # 4. Actualizar/Crear la sección [SYMBOLS]
+        if not config.has_section('SYMBOLS'):
+            config.add_section('SYMBOLS')
+        config.set('SYMBOLS', 'symbols_to_trade', symbols_to_save)
+        logger.debug(f"Actualizando [SYMBOLS] symbols_to_trade = {symbols_to_save}")
 
-        # Escribir los cambios de vuelta al archivo config.ini
-        with open(CONFIG_FILE_PATH, 'w') as configfile:
+        # 5. Escribir los cambios de vuelta al archivo config.ini
+        with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as configfile:
             config.write(configfile)
         
         logger.info(f"Archivo de configuración {CONFIG_FILE_PATH} actualizado exitosamente.")

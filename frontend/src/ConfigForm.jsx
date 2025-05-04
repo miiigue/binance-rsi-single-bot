@@ -4,7 +4,7 @@ import React, { useState, useEffect } from 'react';
 const initialConfig = {
   apiKey: '',
   apiSecret: '',
-  symbol: 'BTCUSDT',
+  symbolsToTrade: '',
   rsiInterval: '5m',
   rsiPeriod: 14,
   rsiThresholdUp: 8,
@@ -19,27 +19,28 @@ const initialConfig = {
 };
 
 // Helper function to parse potential numbers from config
-const parseValue = (value) => {
-  if (value === '' || value === '-') {
-    return value;
+const parseValue = (value, defaultValue) => {
+  if (value === '' || value === null || value === undefined) return defaultValue;
+  if (value === '-') {
+    return name === 'stopLossUSDT' ? value : defaultValue;
   }
   const num = Number(value);
   if (!isNaN(num)) {
-    if (value === 'stopLossUSDT' && num > 0) {
+    if (name === 'stopLossUSDT' && num > 0) {
       console.warn("Stop Loss debe ser negativo o cero.");
     }
-    if (value === 'takeProfitUSDT' && num < 0) {
+    if (name === 'takeProfitUSDT' && num < 0) {
       console.warn("Take Profit debe ser positivo o cero.");
     }
-    if (value === 'rsiPeriod' && (!Number.isInteger(num) || num <= 0)) {
+    if (name === 'rsiPeriod' && (!Number.isInteger(num) || num <= 0)) {
       console.warn("RSI Period debe ser un entero positivo.");
     }
-    if (value === 'cycleSleepSeconds' && num !== 0 && (num < 5 || !Number.isInteger(num))) {
+    if (name === 'cycleSleepSeconds' && num !== 0 && (num < 5 || !Number.isInteger(num))) {
       console.warn("Tiempo de espera debe ser 0 (auto) o un entero >= 5 segundos.");
     }
     return num;
   }
-  return value;
+  return defaultValue;
 };
 
 function ConfigForm() {
@@ -66,7 +67,7 @@ function ConfigForm() {
           apiKey: backendConfig.BINANCE?.api_key || '',
           apiSecret: backendConfig.BINANCE?.api_secret || '',
           mode: backendConfig.BINANCE?.mode || 'paper',
-          symbol: backendConfig.TRADING?.symbol || 'BTCUSDT',
+          symbolsToTrade: backendConfig.SYMBOLS?.symbols_to_trade || '',
           rsiInterval: backendConfig.TRADING?.rsi_interval || '5m',
           rsiPeriod: parseValue(backendConfig.TRADING?.rsi_period, 14),
           rsiThresholdUp: parseValue(backendConfig.TRADING?.rsi_threshold_up, 8),
@@ -101,33 +102,22 @@ function ConfigForm() {
 
     let processedValue = value;
 
-    // Procesamiento especial para campos numéricos
-    if (type === 'number' || ['rsiPeriod', 'takeProfitUSDT', 'stopLossUSDT', 'positionSizeUSDT', 'rsiThresholdUp', 'rsiThresholdDown', 'cycleSleepSeconds'].includes(name)) {
+    if (type === 'checkbox') {
+      processedValue = checked;
+    } else if (name === 'symbolsToTrade') {
+      processedValue = value;
+    } else if (type === 'number' || [
+      'rsiPeriod', 'rsiThresholdUp', 'rsiThresholdDown', 'rsiEntryLevelLow',
+      'positionSizeUSDT', 'takeProfitUSDT', 'stopLossUSDT', 'cycleSleepSeconds'
+    ].includes(name)) {
       if (value === '' || (value === '-' && name === 'stopLossUSDT')) {
         processedValue = value;
       } else {
         const num = Number(value);
-        if (!isNaN(num)) {
-          if (name === 'stopLossUSDT' && num > 0) {
-             console.warn("Stop Loss debe ser negativo o cero.");
-          }
-          if (name === 'takeProfitUSDT' && num < 0) {
-              console.warn("Take Profit debe ser positivo o cero.");
-          }
-           if (name === 'rsiPeriod' && (!Number.isInteger(num) || num <= 0)) {
-              console.warn("RSI Period debe ser un entero positivo.");
-          }
-          if (name === 'cycleSleepSeconds' && num !== 0 && (num < 5 || !Number.isInteger(num))) {
-            console.warn("Tiempo de espera debe ser 0 (auto) o un entero >= 5 segundos.");
-          }
-          processedValue = num;
-        } else {
-          return;
-        }
+        processedValue = isNaN(num) ? config[name] : num;
       }
-    }
-     else if (type === 'checkbox') {
-      processedValue = checked;
+    } else {
+      processedValue = value;
     }
 
     setConfig(prevConfig => ({
@@ -142,27 +132,30 @@ function ConfigForm() {
     e.preventDefault();
     setMessage('Guardando configuración...');
 
-    // Validar y ajustar valores antes de enviar
-    let sleepSecondsToSend = 0;
-    if (config.cycleSleepSeconds !== '' && !isNaN(Number(config.cycleSleepSeconds))) {
-        const sleepNum = Number(config.cycleSleepSeconds);
-        if (Number.isInteger(sleepNum) && sleepNum >= 5) {
-            sleepSecondsToSend = sleepNum;
-        } else if (sleepNum !== 0) {
-             console.warn(`Valor inválido para Tiempo de Espera (${config.cycleSleepSeconds}). Se usará cálculo automático (0).`);
-             // Dejar sleepSecondsToSend en 0
-        }
-         // Si es 0, también se queda en 0
-    } // Si está vacío o no es número, también se queda en 0
+    // Limpiar y validar la lista de símbolos antes de enviar
+    const symbolsRaw = config.symbolsToTrade || '';
+    const symbolsList = symbolsRaw.split(',').map(s => s.trim().toUpperCase()).filter(s => s);
+    const cleanSymbolsString = symbolsList.join(',');
 
+    // Crear el objeto a enviar, asegurando tipos correctos
     const configToSend = {
-        ...config,
-        rsiPeriod: Number.isInteger(config.rsiPeriod) && config.rsiPeriod > 0 ? config.rsiPeriod : 14,
-        stopLossUSDT: config.stopLossUSDT <= 0 ? config.stopLossUSDT : 0,
-        takeProfitUSDT: config.takeProfitUSDT >= 0 ? config.takeProfitUSDT : 0,
-        cycleSleepSeconds: sleepSecondsToSend
+      apiKey: config.apiKey,
+      apiSecret: config.apiSecret,
+      mode: config.mode,
+      symbolsToTrade: cleanSymbolsString,
+      rsiInterval: config.rsiInterval,
+      rsiPeriod: parseValue(config.rsiPeriod, initialConfig.rsiPeriod),
+      rsiThresholdUp: parseValue(config.rsiThresholdUp, initialConfig.rsiThresholdUp),
+      rsiThresholdDown: parseValue(config.rsiThresholdDown, initialConfig.rsiThresholdDown),
+      rsiEntryLevelLow: parseValue(config.rsiEntryLevelLow, initialConfig.rsiEntryLevelLow),
+      positionSizeUSDT: parseValue(config.positionSizeUSDT, initialConfig.positionSizeUSDT),
+      stopLossUSDT: parseValue(config.stopLossUSDT, initialConfig.stopLossUSDT),
+      takeProfitUSDT: parseValue(config.takeProfitUSDT, initialConfig.takeProfitUSDT),
+      cycleSleepSeconds: parseValue(config.cycleSleepSeconds, initialConfig.cycleSleepSeconds),
     };
-    setConfig(configToSend);
+    
+    // Actualizar el estado local con los valores limpios (opcional, pero bueno para UI)
+    setConfig(prev => ({ ...prev, ...configToSend, active: prev.active }));
 
     try {
       const response = await fetch('http://localhost:5001/api/config', {
@@ -192,10 +185,11 @@ function ConfigForm() {
 
   // Clases reutilizables de Tailwind para los inputs y labels
   const labelClass = "block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1";
-  const inputBaseClass = "mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm";
+  const inputBaseClass = "mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm text-gray-900 dark:text-gray-100";
   const inputClass = `${inputBaseClass}`;
   const inputNumberClass = `${inputBaseClass} [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none`; // Oculta flechas en input number
   const selectClass = inputBaseClass;
+  const textareaClass = `${inputBaseClass} min-h-[60px]`;
 
   return (
     // Añadir un div para mostrar mensajes de estado/error
@@ -253,27 +247,27 @@ function ConfigForm() {
 
         {/* Sección Configuración Trading */}
         <fieldset className="border pt-4 px-4 pb-6 rounded-md border-gray-300 dark:border-gray-600">
-            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Configuración Trading</legend>
+            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Configuración General Trading</legend>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
-              <div>
-                <label htmlFor="symbol" className={labelClass}>
-                  Par de Trading <span className="text-red-500">*</span>
+              <div className="md:col-span-2">
+                <label htmlFor="symbolsToTrade" className={labelClass}>
+                  Símbolos a Operar (separados por coma) <span className="text-red-500">*</span>
                 </label>
-                <input
-                  type="text"
-                  name="symbol"
-                  id="symbol"
-                  value={config.symbol}
+                <textarea
+                  name="symbolsToTrade"
+                  id="symbolsToTrade"
+                  value={config.symbolsToTrade}
                   onChange={handleChange}
-                  className={inputClass}
+                  className={textareaClass}
                   required
-                  placeholder="Ej: BTCUSDT"
+                  placeholder="Ej: ETHUSDT,ADAUSDT,DOTUSDT,SOLUSDT"
+                  rows={2}
                 />
-                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Asegúrate que sea un par de futuros válido.</p>
+                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Lista de pares de futuros a operar. Asegúrate que sean válidos.</p>
               </div>
               <div>
                 <label htmlFor="rsiInterval" className={labelClass}>
-                  Intervalo RSI <span className="text-red-500">*</span>
+                  Intervalo RSI (para todos) <span className="text-red-500">*</span>
                 </label>
                 <select
                   name="rsiInterval"
@@ -291,7 +285,6 @@ function ConfigForm() {
                   <option value="1h">1 hora</option>
                   <option value="2h">2 horas</option>
                   <option value="4h">4 horas</option>
-                  {/* Añadir más intervalos si es necesario */}
                 </select>
               </div>
             </div>
@@ -299,7 +292,7 @@ function ConfigForm() {
 
         {/* Sección Parámetros RSI */}
         <fieldset className="border pt-4 px-4 pb-6 rounded-md border-gray-300 dark:border-gray-600">
-            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Parámetros RSI</legend>
+            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Parámetros RSI (Compartidos)</legend>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mt-4"> 
               <div>
                 <label htmlFor="rsiPeriod" className={labelClass}>
@@ -374,7 +367,7 @@ function ConfigForm() {
 
         {/* Sección Gestión de Riesgo */}
         <fieldset className="border pt-4 px-4 pb-6 rounded-md border-gray-300 dark:border-gray-600">
-            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Gestión de Riesgo</legend>
+            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Gestión de Riesgo (Compartida)</legend>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-4">
               <div>
                 <label htmlFor="positionSizeUSDT" className={labelClass}>
