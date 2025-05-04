@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+ 
+/* Puedes añadir estilos globales adicionales aquí si es necesario */
+body {
+  /* Ejemplo: un fondo suave por defecto */
+  @apply bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100;
+} 

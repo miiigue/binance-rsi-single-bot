@@ -1,0 +1,23 @@
+# Librerías principales para el bot de Binance
+# python-binance
+psycopg2-binary # Para la conexión con PostgreSQL
+numpy # Dependencia común para cálculos numéricos
+pandas # Para manejar series de datos (precios, indicadores)
+websockets # Para la conexión en tiempo real de python-binance
+
+# Librería para indicadores técnicos (alternativa pura Python a TA-Lib)
+pandas-ta
+
+# Librerías para el servidor API (Interfaz Web)
+Flask
+Flask-CORS # Para permitir peticiones desde el frontend
+
+# Librería para indicadores técnicos (como RSI)
+# Nota: TA-Lib debe instalarse manualmente usando el archivo .whl apropiado
+# para tu sistema operativo y versión de Python desde:
+# https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib
+# Una vez instalado el .whl, no es necesario tener TA-Lib aquí.
+# TA-Lib
+
+# Nueva librería
+binance-futures-connector 
