@@ -261,6 +261,152 @@ def get_futures_position(symbol: str):
         logger.error(f"Error inesperado al obtener información de posición/riesgo para {symbol}: {e}", exc_info=True)
         return None
 
+# --- Funciones existentes ---
+# get_historical_klines(...)
+# get_futures_symbol_info(...)
+# create_futures_market_order(...)
+# get_futures_position(...)
+
+# --- NUEVAS FUNCIONES PARA ÓRDENES LIMIT ---
+
+def get_order_book_ticker(symbol: str) -> dict | None:
+    """
+    Obtiene el mejor precio de compra (Bid) y venta (Ask) actual para un símbolo.
+    Utiliza el endpoint futures_book_ticker.
+
+    Args:
+        symbol: El símbolo del par de futuros (ej: 'BTCUSDT').
+
+    Returns:
+        Un diccionario con 'bidPrice', 'askPrice' y otros datos si tiene éxito, None si hay error.
+    """
+    client = get_futures_client()
+    logger = get_logger()
+    if not client:
+        logger.error("Cliente Binance no disponible para get_order_book_ticker.")
+        return None
+    try:
+        # ticker = client.ticker_bookTicker(symbol=symbol.upper()) # Incorrecto 7
+
+        # --- Octavo intento: Volvemos a book_ticker, que DEBERÍA ser el correcto ---
+        ticker = client.book_ticker(symbol=symbol.upper()) 
+        
+        # Verificar si la respuesta contiene Bid y Ask
+        bid_price = ticker.get('bidPrice')
+        ask_price = ticker.get('askPrice')
+
+        if bid_price is None or ask_price is None:
+            logger.error(f"La respuesta de 'book_ticker' para {symbol} no contiene 'bidPrice' o 'askPrice'. Respuesta: {ticker}")
+            return None
+            
+        logger.debug(f"Ticker book_ticker obtenido para {symbol}: Bid={bid_price}, Ask={ask_price}")
+        return ticker # Devolver el ticker completo si Bid/Ask están presentes
+
+    except AttributeError:
+        logger.error(f"El método 'book_ticker' sigue sin existir en UMFutures. ¡Muy extraño!")
+        return None
+    except Exception as e:
+        logger.error(f"Error al obtener el book ticker para {symbol} con 'book_ticker': {e}")
+        return None
+
+def create_futures_limit_order(symbol: str, side: str, quantity: float, price: float) -> dict | None:
+    """
+    Crea una orden LIMIT en Binance Futures.
+    Utiliza timeInForce='GTC' (Good 'Til Canceled).
+
+    Args:
+        symbol: Símbolo del par (ej: 'BTCUSDT').
+        side: 'BUY' o 'SELL'.
+        quantity: La cantidad a comprar/vender.
+        price: El precio límite para la orden.
+
+    Returns:
+        El diccionario de respuesta de la API si la orden se creó exitosamente, None si falló.
+    """
+    client = get_futures_client()
+    logger = get_logger()
+    if not client:
+        logger.error("Cliente Binance no disponible para create_futures_limit_order.")
+        return None
+
+    side = side.upper()
+    if side not in ['BUY', 'SELL']:
+        logger.error(f"Lado inválido '{side}' para crear orden LIMIT.")
+        return None
+
+    try:
+        logger.info(f"Intentando crear orden LIMIT {side} para {quantity} {symbol} @ {price}")
+        order = client.new_order(
+            symbol=symbol.upper(),
+            side=side,
+            type='LIMIT',
+            timeInForce='GTC',
+            quantity=quantity,
+            price=price,
+            positionSide='LONG'
+        )
+        logger.info(f"Orden LIMIT {side} creada para {symbol}. Respuesta API: {order}")
+        # La respuesta contendrá el orderId, status ('NEW'), etc.
+        return order
+    except Exception as e:
+        logger.error(f"Error al crear orden LIMIT {side} para {symbol} @ {price}: {e}", exc_info=True)
+        return None
+
+def get_order_status(symbol: str, order_id: int) -> dict | None:
+    """
+    Consulta el estado de una orden específica en Binance Futures.
+
+    Args:
+        symbol: Símbolo del par (ej: 'BTCUSDT').
+        order_id: El ID de la orden a consultar.
+
+    Returns:
+        Un diccionario con la información de la orden si tiene éxito, None si hay error.
+        El estado importante está en la clave 'status'.
+    """
+    client = get_futures_client()
+    logger = get_logger()
+    if not client:
+        logger.error("Cliente Binance no disponible para get_order_status.")
+        return None
+    try:
+        order_info = client.query_order(symbol=symbol.upper(), orderId=order_id)
+        logger.debug(f"Estado obtenido para orden {order_id} ({symbol}): Status={order_info.get('status')}")
+        return order_info
+    except Exception as e:
+        # Un error común aquí es "Order does not exist", que puede pasar si ya fue purgada
+        # Lo manejaremos en la lógica del bot
+        logger.warning(f"Error al obtener estado de la orden {order_id} ({symbol}): {e}")
+        return None
+
+def cancel_futures_order(symbol: str, order_id: int) -> dict | None:
+    """
+    Cancela una orden abierta específica en Binance Futures.
+
+    Args:
+        symbol: Símbolo del par (ej: 'BTCUSDT').
+        order_id: El ID de la orden a cancelar.
+
+    Returns:
+        Un diccionario con la respuesta de cancelación si tiene éxito, None si hay error.
+    """
+    client = get_futures_client()
+    logger = get_logger()
+    if not client:
+        logger.error("Cliente Binance no disponible para cancel_futures_order.")
+        return None
+    try:
+        logger.warning(f"Intentando cancelar orden {order_id} para {symbol}...")
+        cancel_response = client.cancel_order(symbol=symbol.upper(), orderId=order_id)
+        logger.info(f"Respuesta de cancelación para orden {order_id} ({symbol}): {cancel_response}")
+        # La respuesta confirma los detalles de la orden cancelada.
+        return cancel_response
+    except Exception as e:
+        # Un error común es si la orden ya no existe (fue llenada o cancelada justo antes)
+        logger.error(f"Error al intentar cancelar orden {order_id} ({symbol}): {e}", exc_info=False) # No mostrar traceback completo para errores esperados
+        return None
+# --- FIN NUEVAS FUNCIONES ---
+
 # --- Bloque de ejemplo (opcionalmente actualizar si se usa) ---
 if __name__ == '__main__':
     # ... (El código de prueba aquí necesitaría ser adaptado también a la nueva librería) ...

@@ -10,16 +10,19 @@ const initialConfig = {
   rsiThresholdUp: 8,
   rsiThresholdDown: -8,
   rsiEntryLevelLow: 25,
+  volumeSmaPeriod: 20,
+  volumeFactor: 1.5,
   positionSizeUSDT: 50,
   stopLossUSDT: -0.3,
   takeProfitUSDT: 0,
   cycleSleepSeconds: 0,
   mode: 'paper',
   active: false,
+  orderTimeoutSeconds: 60,
 };
 
 // Helper function to parse potential numbers from config
-const parseValue = (value, defaultValue) => {
+const parseValue = (value, defaultValue, name = '') => {
   if (value === '' || value === null || value === undefined) return defaultValue;
   if (value === '-') {
     return name === 'stopLossUSDT' ? value : defaultValue;
@@ -37,6 +40,12 @@ const parseValue = (value, defaultValue) => {
     }
     if (name === 'cycleSleepSeconds' && num !== 0 && (num < 5 || !Number.isInteger(num))) {
       console.warn("Tiempo de espera debe ser 0 (auto) o un entero >= 5 segundos.");
+    }
+    if (name === 'volumeSmaPeriod' && (!Number.isInteger(num) || num <= 0)) {
+      console.warn("Volume SMA Period debe ser un entero positivo.");
+    }
+    if (name === 'volumeFactor' && num <= 0) {
+      console.warn("Volume Factor debe ser positivo.");
     }
     return num;
   }
@@ -69,14 +78,17 @@ function ConfigForm() {
           mode: backendConfig.BINANCE?.mode || 'paper',
           symbolsToTrade: backendConfig.SYMBOLS?.symbols_to_trade || '',
           rsiInterval: backendConfig.TRADING?.rsi_interval || '5m',
-          rsiPeriod: parseValue(backendConfig.TRADING?.rsi_period, 14),
-          rsiThresholdUp: parseValue(backendConfig.TRADING?.rsi_threshold_up, 8),
-          rsiThresholdDown: parseValue(backendConfig.TRADING?.rsi_threshold_down, -8),
-          rsiEntryLevelLow: parseValue(backendConfig.TRADING?.rsi_entry_level_low, 25),
-          positionSizeUSDT: parseValue(backendConfig.TRADING?.position_size_usdt, 50),
-          stopLossUSDT: parseValue(backendConfig.TRADING?.stop_loss_usdt, -0.3),
-          takeProfitUSDT: parseValue(backendConfig.TRADING?.take_profit_usdt, 0),
-          cycleSleepSeconds: parseValue(backendConfig.TRADING?.cycle_sleep_seconds, 0),
+          rsiPeriod: parseValue(backendConfig.TRADING?.rsi_period, 14, 'rsiPeriod'),
+          rsiThresholdUp: parseValue(backendConfig.TRADING?.rsi_threshold_up, 8, 'rsiThresholdUp'),
+          rsiThresholdDown: parseValue(backendConfig.TRADING?.rsi_threshold_down, -8, 'rsiThresholdDown'),
+          rsiEntryLevelLow: parseValue(backendConfig.TRADING?.rsi_entry_level_low, 25, 'rsiEntryLevelLow'),
+          volumeSmaPeriod: parseValue(backendConfig.TRADING?.volume_sma_period, 20, 'volumeSmaPeriod'),
+          volumeFactor: parseValue(backendConfig.TRADING?.volume_factor, 1.5, 'volumeFactor'),
+          positionSizeUSDT: parseValue(backendConfig.TRADING?.position_size_usdt, 50, 'positionSizeUSDT'),
+          stopLossUSDT: parseValue(backendConfig.TRADING?.stop_loss_usdt, -0.3, 'stopLossUSDT'),
+          takeProfitUSDT: parseValue(backendConfig.TRADING?.take_profit_usdt, 0, 'takeProfitUSDT'),
+          cycleSleepSeconds: parseValue(backendConfig.TRADING?.cycle_sleep_seconds, 0, 'cycleSleepSeconds'),
+          orderTimeoutSeconds: parseValue(backendConfig.TRADING?.order_timeout_seconds, 60, 'orderTimeoutSeconds'),
           active: config.active,
         };
 
@@ -108,7 +120,8 @@ function ConfigForm() {
       processedValue = value;
     } else if (type === 'number' || [
       'rsiPeriod', 'rsiThresholdUp', 'rsiThresholdDown', 'rsiEntryLevelLow',
-      'positionSizeUSDT', 'takeProfitUSDT', 'stopLossUSDT', 'cycleSleepSeconds'
+      'volumeSmaPeriod', 'volumeFactor',
+      'positionSizeUSDT', 'takeProfitUSDT', 'stopLossUSDT', 'cycleSleepSeconds', 'orderTimeoutSeconds'
     ].includes(name)) {
       if (value === '' || (value === '-' && name === 'stopLossUSDT')) {
         processedValue = value;
@@ -144,14 +157,17 @@ function ConfigForm() {
       mode: config.mode,
       symbolsToTrade: cleanSymbolsString,
       rsiInterval: config.rsiInterval,
-      rsiPeriod: parseValue(config.rsiPeriod, initialConfig.rsiPeriod),
-      rsiThresholdUp: parseValue(config.rsiThresholdUp, initialConfig.rsiThresholdUp),
-      rsiThresholdDown: parseValue(config.rsiThresholdDown, initialConfig.rsiThresholdDown),
-      rsiEntryLevelLow: parseValue(config.rsiEntryLevelLow, initialConfig.rsiEntryLevelLow),
-      positionSizeUSDT: parseValue(config.positionSizeUSDT, initialConfig.positionSizeUSDT),
-      stopLossUSDT: parseValue(config.stopLossUSDT, initialConfig.stopLossUSDT),
-      takeProfitUSDT: parseValue(config.takeProfitUSDT, initialConfig.takeProfitUSDT),
-      cycleSleepSeconds: parseValue(config.cycleSleepSeconds, initialConfig.cycleSleepSeconds),
+      rsiPeriod: parseValue(config.rsiPeriod, initialConfig.rsiPeriod, 'rsiPeriod'),
+      rsiThresholdUp: parseValue(config.rsiThresholdUp, initialConfig.rsiThresholdUp, 'rsiThresholdUp'),
+      rsiThresholdDown: parseValue(config.rsiThresholdDown, initialConfig.rsiThresholdDown, 'rsiThresholdDown'),
+      rsiEntryLevelLow: parseValue(config.rsiEntryLevelLow, initialConfig.rsiEntryLevelLow, 'rsiEntryLevelLow'),
+      volumeSmaPeriod: parseValue(config.volumeSmaPeriod, initialConfig.volumeSmaPeriod, 'volumeSmaPeriod'),
+      volumeFactor: parseValue(config.volumeFactor, initialConfig.volumeFactor, 'volumeFactor'),
+      positionSizeUSDT: parseValue(config.positionSizeUSDT, initialConfig.positionSizeUSDT, 'positionSizeUSDT'),
+      stopLossUSDT: parseValue(config.stopLossUSDT, initialConfig.stopLossUSDT, 'stopLossUSDT'),
+      takeProfitUSDT: parseValue(config.takeProfitUSDT, initialConfig.takeProfitUSDT, 'takeProfitUSDT'),
+      cycleSleepSeconds: parseValue(config.cycleSleepSeconds, initialConfig.cycleSleepSeconds, 'cycleSleepSeconds'),
+      orderTimeoutSeconds: parseValue(config.orderTimeoutSeconds, initialConfig.orderTimeoutSeconds, 'orderTimeoutSeconds'),
     };
     
     // Actualizar el estado local con los valores limpios (opcional, pero bueno para UI)
@@ -292,8 +308,8 @@ function ConfigForm() {
 
         {/* Sección Parámetros RSI */}
         <fieldset className="border pt-4 px-4 pb-6 rounded-md border-gray-300 dark:border-gray-600">
-            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Parámetros RSI (Compartidos)</legend>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mt-4"> 
+            <legend className="text-base font-medium text-gray-900 dark:text-gray-100 px-2">Parámetros RSI y Volumen (Compartidos)</legend>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-4"> 
               <div>
                 <label htmlFor="rsiPeriod" className={labelClass}>
                   Periodo RSI <span className="text-red-500">*</span>
@@ -361,6 +377,40 @@ function ConfigForm() {
                   placeholder="e.g., 25"
                 />
                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Entrar si RSI está bajo este valor (y cambio RSI OK).</p>
+              </div>
+              <div>
+                <label htmlFor="volumeSmaPeriod" className={labelClass}>
+                  Periodo SMA Volumen
+                </label>
+                <input
+                  type="number"
+                  name="volumeSmaPeriod"
+                  id="volumeSmaPeriod"
+                  value={config.volumeSmaPeriod}
+                  onChange={handleChange}
+                  className={inputNumberClass}
+                  min="1"
+                  step="1"
+                  placeholder="Ej: 20"
+                />
+                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Velas para calcular volumen promedio.</p>
+              </div>
+              <div>
+                <label htmlFor="volumeFactor" className={labelClass}>
+                  Factor Volumen
+                </label>
+                <input
+                  type="number"
+                  name="volumeFactor"
+                  id="volumeFactor"
+                  value={config.volumeFactor}
+                  onChange={handleChange}
+                  className={inputNumberClass}
+                  min="0.01"
+                  step="0.01"
+                  placeholder="Ej: 1.5"
+                />
+                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Volumen actual {'>'} SMA * Factor (Ej: 1.5 = +50%).</p>
               </div>
             </div>
         </fieldset>
@@ -461,6 +511,23 @@ function ConfigForm() {
                   placeholder="Ej: 10 (0 = auto)"
                 />
                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Segundos entre ciclos. 0 = Auto (basado en intervalo RSI, mín 60s).</p>
+              </div>
+              <div>
+                <label htmlFor="orderTimeoutSeconds" className={labelClass}>
+                  Timeout (seg)
+                </label>
+                <input
+                  type="number"
+                  name="orderTimeoutSeconds"
+                  id="orderTimeoutSeconds"
+                  value={config.orderTimeoutSeconds}
+                  onChange={handleChange}
+                  className={inputNumberClass}
+                  min="0"
+                  step="1"
+                  placeholder="Ej: 60"
+                />
+                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Segundos a esperar antes de cancelar una orden LIMIT no completada (0 = sin timeout).</p>
               </div>
               <div className="flex items-center justify-start pt-5">
                   <input

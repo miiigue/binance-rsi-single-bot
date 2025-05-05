@@ -48,13 +48,13 @@ def config_to_dict(config: configparser.ConfigParser) -> dict:
     return the_dict
 
 def map_frontend_trading_binance(frontend_data: dict) -> dict:
-    """ Mapea solo las claves de [TRADING] y [BINANCE] """
+    """ Mapea claves de [TRADING] y [BINANCE] (y ahora volumen) """
     mapping = {
         # BINANCE
         'apiKey': ('BINANCE', 'api_key'), 
         'apiSecret': ('BINANCE', 'api_secret'),
         'mode': ('BINANCE', 'mode'),
-        # TRADING (Excluyendo símbolos)
+        # TRADING
         'rsiInterval': ('TRADING', 'rsi_interval'),
         'rsiPeriod': ('TRADING', 'rsi_period'),
         'rsiThresholdUp': ('TRADING', 'rsi_threshold_up'),
@@ -64,6 +64,12 @@ def map_frontend_trading_binance(frontend_data: dict) -> dict:
         'stopLossUSDT': ('TRADING', 'stop_loss_usdt'),
         'takeProfitUSDT': ('TRADING', 'take_profit_usdt'),
         'cycleSleepSeconds': ('TRADING', 'cycle_sleep_seconds'),
+        # --- Añadir mapeo de volumen --- 
+        'volumeSmaPeriod': ('TRADING', 'volume_sma_period'),
+        'volumeFactor': ('TRADING', 'volume_factor'),
+        # --- Añadir mapeo para timeout --- 
+        'orderTimeoutSeconds': ('TRADING', 'order_timeout_seconds'),
+        # --------------------------------
     }
     ini_data = {}
     for frontend_key, value in frontend_data.items():
