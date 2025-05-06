@@ -104,23 +104,32 @@ def get_historical_klines(symbol: str, interval: str, limit: int = 500):
             logger.warning(f"No se recibieron klines para {symbol}, intervalo {interval}. ¿Es el símbolo correcto?")
             return None
 
-        # La estructura de datos devuelta debería ser la misma (lista de listas)
+        # Use lowercase and underscore standard column names
         columns = [
-            'Open time', 'Open', 'High', 'Low', 'Close', 'Volume',
-            'Close time', 'Quote asset volume', 'Number of trades',
-            'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
         ]
         df = pd.DataFrame(klines, columns=columns)
 
-        # Conversiones numéricas y de fecha (igual que antes)
-        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'Quote asset volume',
-                        'Taker buy base asset volume', 'Taker buy quote asset volume']
+        # Convert appropriate columns to numeric types
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume',
+                        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col])
-        df['Open time'] = pd.to_datetime(df['Open time'], unit='ms', utc=True)
-        df['Close time'] = pd.to_datetime(df['Close time'], unit='ms', utc=True)
+            # Use errors='coerce' to turn invalid parsing into NaN (Not a Number)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        logger.info(f"Se obtuvieron {len(df)} klines para {symbol}. Última vela cierra a: {df['Close time'].iloc[-1]}")
+        # Convert timestamp columns to datetime objects (UTC)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
+        
+        # Optional: Drop rows with NaN values in critical columns like 'close' or 'volume'
+        # df.dropna(subset=['close', 'volume'], inplace=True)
+        # Optional: Set timestamp as index
+        # df.set_index('timestamp', inplace=True)
+
+        # Log using the new column name 'close_time'
+        logger.info(f"Se obtuvieron {len(df)} klines para {symbol}. Última vela cierra a: {df['close_time'].iloc[-1]}")
         return df
 
     except ClientError as e:

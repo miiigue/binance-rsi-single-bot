@@ -7,14 +7,22 @@ import logging
 import time # Para time.sleep()
 import threading # <--- Importar threading
 import signal # <--- Para manejar señales de terminación
+import os
+
+# Añadir el directorio raíz al sys.path para importar desde src
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# sys.path.append(current_dir) # No es ideal, mejor usar imports relativos o estructura de paquete
 
 # Importar las piezas necesarias desde nuestro paquete 'src'
 try:
     from src.config_loader import load_config, get_trading_symbols, CONFIG_FILE_PATH
-    from src.logger_setup import setup_logging
+    from src.logger_setup import setup_logging, get_logger
     # La clase se llama TradingBot, su __init__ no toma args,
     # y tiene un método run_once() síncrono.
-    from src.bot import TradingBot
+    from src.bot import TradingBot, BotState
+    # --- Importar función de inicialización de DB --- 
+    from src.database import init_db_schema
+    # ----------------------------------------------
 except ImportError as e:
     import traceback
     traceback.print_exc()
@@ -26,6 +34,11 @@ except ImportError as e:
 
 # Variable global para indicar a los hilos que deben detenerse
 stop_event = threading.Event()
+threads = [] # Lista para guardar los hilos
+# --- Diccionario y Lock para Estados de Workers ---
+worker_statuses = {} # Ej: {'BTCUSDT': {'state': 'IN_POSITION', 'pnl': 5.2}, 'ETHUSDT': ...}
+status_lock = threading.Lock() # Para proteger el acceso a worker_statuses
+# -------------------------------------------------
 
 def calculate_sleep_from_interval(interval_str: str) -> int:
     """Calcula segundos de espera basados en el string del intervalo (e.g., '1m', '5m', '1h'). Mínimo 60s."""
@@ -76,55 +89,113 @@ def get_sleep_seconds(trading_params: dict) -> int:
         logger.error(f"Error inesperado al obtener tiempo de espera: {e}. Usando 60s por defecto.", exc_info=True)
         return 60
 
-def run_bot_worker(bot_instance: TradingBot, sleep_seconds: int):
+def run_bot_worker(symbol, trading_params, stop_event):
     """Función ejecutada por cada hilo para manejar un bot de símbolo único."""
-    logger = logging.getLogger() # Usar el logger global
-    symbol = bot_instance.symbol # Obtener símbolo para logs
-    logger.info(f"[{symbol}] Iniciando worker thread. Tiempo de espera: {sleep_seconds}s")
+    logger = get_logger()
+    
+    # --- Crear la instancia del Bot UNA SOLA VEZ ---
+    bot_instance = None
+    try:
+        bot_instance = TradingBot(symbol=symbol, trading_params=trading_params)
+        # --- Inicializar estado en el diccionario compartido ---
+        with status_lock:
+             worker_statuses[symbol] = bot_instance.get_current_status() 
+             # Inicialmente podría ser INITIALIZING o ya IN_POSITION si detectó algo
+        # ---------------------------------------------------
+        logger.info(f"[{symbol}] Worker thread iniciado. Instancia de TradingBot creada. Tiempo de espera: {get_sleep_seconds(trading_params)}s")
+    except (ValueError, ConnectionError) as init_error:
+         logger.error(f"No se pudo inicializar la instancia de TradingBot para {symbol}: {init_error}. Terminando worker.", exc_info=True)
+         # --- Actualizar estado a ERROR en el diccionario compartido ---
+         with status_lock:
+              worker_statuses[symbol] = {
+                  'symbol': symbol,
+                  'state': BotState.ERROR.value, # Usar el valor del Enum
+                  'last_error': str(init_error),
+                  # Añadir otros campos con None o valores por defecto
+                  'in_position': False,
+                  'entry_price': None,
+                  'quantity': None,
+                  'pnl': None,
+                  'pending_entry_order_id': None,
+                  'pending_exit_order_id': None
+              }
+         # ----------------------------------------------------------
+         return # Salir de la función si falla la inicialización
+    except Exception as thread_error:
+         logger.error(f"Error inesperado al crear instancia de TradingBot para {symbol}: {thread_error}. Terminando worker.", exc_info=True)
+         # --- Actualizar estado a ERROR en el diccionario compartido ---
+         with status_lock:
+              worker_statuses[symbol] = {
+                  'symbol': symbol,
+                  'state': BotState.ERROR.value, 
+                  'last_error': f"Unexpected init error: {thread_error}",
+                  'in_position': False, 'entry_price': None, 'quantity': None, 'pnl': None,
+                  'pending_entry_order_id': None, 'pending_exit_order_id': None
+              }
+         # ----------------------------------------------------------
+         return
 
-    while not stop_event.is_set(): # Continuar mientras no se pida parar
-        start_time = time.monotonic()
+    # Calcular tiempo de espera
+    sleep_duration = get_sleep_seconds(trading_params)
+
+    while not stop_event.is_set():
         try:
-            # Ejecutar la lógica del bot para este símbolo
-            logger.debug(f"[{symbol}] Ejecutando run_once()...")
-            bot_instance.run_once()
-            logger.debug(f"[{symbol}] run_once() completado.")
+            # --- Ejecutar un ciclo del bot ---
+            if bot_instance: # Asegurarse que la instancia fue creada
+                bot_instance.run_once()
 
-        except ConnectionError as conn_err:
-             logger.error(f"[{symbol}] Error de conexión en worker: {conn_err}. Reintentando en {sleep_seconds}s...", exc_info=True)
-             # Esperar antes de reintentar en caso de error de conexión
-        except ValueError as val_err:
-             logger.error(f"[{symbol}] Error de configuración/valor en worker: {val_err}. El worker para este símbolo probablemente no pueda continuar.", exc_info=True)
-             # Podríamos decidir parar este hilo específicamente aquí
-             break # Salir del bucle while si hay error de configuración
+            # --- Actualizar estado en diccionario compartido --- 
+            if bot_instance:
+                with status_lock:
+                     worker_statuses[symbol] = bot_instance.get_current_status()
+            # --------------------------------------------------
+
         except Exception as cycle_error:
-            logger.error(f"[{symbol}] Error inesperado en worker: {cycle_error}", exc_info=True)
-            # Esperar igualmente antes de reintentar
+            logger.error(f"[{symbol}] Error inesperado en el ciclo principal del worker: {cycle_error}", exc_info=True)
+            # --- Actualizar estado a ERROR en diccionario compartido --- 
+            if bot_instance:
+                # Intentar poner el estado de error del bot si es posible
+                bot_instance._set_error_state(f"Unhandled exception in worker loop: {cycle_error}")
+                with status_lock:
+                     worker_statuses[symbol] = bot_instance.get_current_status()
+            else: # Si el error ocurrió antes o sin instancia
+                 with status_lock:
+                      worker_statuses[symbol] = {
+                          'symbol': symbol,
+                          'state': BotState.ERROR.value, 
+                          'last_error': f"Unhandled exception in worker loop: {cycle_error}",
+                          'in_position': False, 'entry_price': None, 'quantity': None, 'pnl': None,
+                          'pending_entry_order_id': None, 'pending_exit_order_id': None
+                      }
+            # ---------------------------------------------------------
+            # ¿Deberíamos detener el worker aquí o intentar continuar?
+            # Por ahora, continuaremos después de un error, el bot intentará recuperarse.
+            # Podríamos añadir un contador de errores para detener si falla repetidamente.
+            pass 
 
-        # Calcular tiempo restante y esperar, pero usando el stop_event
-        end_time = time.monotonic()
-        elapsed_time = end_time - start_time
-        wait_time = max(0, sleep_seconds - elapsed_time)
+        # Esperar antes del próximo ciclo, pero permitir interrupción
+        # logger.debug(f"[{symbol}] Ciclo completado. Esperando {sleep_duration}s...")
+        interrupted = stop_event.wait(timeout=sleep_duration) # Espera N seg O hasta que set() sea llamado
+        if interrupted:
+            logger.info(f"[{symbol}] Señal de parada recibida durante la espera.")
+            break # Salir del bucle while
 
-        logger.debug(f"[{symbol}] Ciclo tomó {elapsed_time:.2f}s. Esperando {wait_time:.2f}s (o hasta señal de stop)...")
-        # Usar wait con timeout para poder interrumpir con el evento
-        stopped = stop_event.wait(timeout=wait_time) 
-        if stopped:
-             logger.info(f"[{symbol}] Señal de parada recibida durante la espera.")
-             break # Salir del bucle si se activó el evento durante la espera
-             
     logger.info(f"[{symbol}] Worker thread terminado.")
+    # --- Opcional: Actualizar estado final a algo como 'STOPPED'? ---
+    # with status_lock:
+    #      if symbol in worker_statuses:
+    #           worker_statuses[symbol]['state'] = 'Stopped' 
+    # ---------------------------------------------------------------
 
-def signal_handler(signum, frame):
+def signal_handler(sig, frame):
     """Manejador para señales como SIGINT (Ctrl+C) y SIGTERM."""
-    logger = logging.getLogger()
-    logger.warning(f"Señal {signal.Signals(signum).name} recibida. Iniciando apagado ordenado...")
+    logger = get_logger()
+    logger.warning(f"Señal {signal.Signals(sig).name} recibida. Iniciando apagado ordenado...")
     stop_event.set() # Indicar a todos los hilos que se detengan
 
 def main():
     """Función principal: configura, crea hilos para cada símbolo y los gestiona."""
     logger = None # Definir logger fuera del try para usarlo en finally
-    threads = [] # Lista para guardar los hilos
     try:
         # 1. Configurar logging (como antes)
         logger = setup_logging(log_filename='bot.log')
@@ -144,14 +215,21 @@ def main():
             logger.error("No se pudo cargar la configuración. Terminando.")
             return
             
-        # 3. Obtener la lista de símbolos
+        # 3. Inicializar el esquema de la base de datos
+        logger.info("Inicializando/Verificando esquema de la base de datos SQLite...")
+        if not init_db_schema():
+            logger.critical("Fallo al inicializar el esquema de la DB. Abortando.")
+            return
+        logger.info("Esquema de la base de datos OK.")
+
+        # 4. Obtener la lista de símbolos
         symbols_to_trade = get_trading_symbols()
         if not symbols_to_trade:
             logger.error("No se especificaron símbolos para operar en [SYMBOLS]/symbols_to_trade. Terminando.")
             return
         logger.info(f"Símbolos a operar: {', '.join(symbols_to_trade)}")
 
-        # 4. Extraer parámetros de trading compartidos
+        # 5. Extraer parámetros de trading compartidos
         if 'TRADING' not in config:
              logger.error("Sección [TRADING] no encontrada en config.ini. Terminando.")
              return
@@ -159,31 +237,24 @@ def main():
         trading_params = dict(config['TRADING'])
         logger.info(f"Parámetros de trading compartidos: {trading_params}")
         
-        # 5. Calcular tiempo de espera (usando los parámetros extraídos)
+        # 6. Calcular tiempo de espera (usando los parámetros extraídos)
         sleep_seconds = get_sleep_seconds(trading_params)
         logger.info(f"Tiempo de espera base entre ciclos para cada worker: {sleep_seconds} segundos.")
 
-        # 6. Crear e iniciar un hilo para cada símbolo
+        # 7. Crear e iniciar un hilo para cada símbolo
         logger.info("Creando e iniciando workers para cada símbolo...")
         for symbol in symbols_to_trade:
             logger.info(f"-> Preparando worker para {symbol}...")
-            try:
-                # Crear la instancia específica del bot para este símbolo
-                bot_instance = TradingBot(symbol=symbol, trading_params=trading_params)
-                
-                # Crear el hilo que ejecutará la función worker para esta instancia
-                thread = threading.Thread(target=run_bot_worker, args=(bot_instance, sleep_seconds), name=f"Worker-{symbol}")
-                thread.daemon = True # Marcar como daemon para que no impidan salir si el principal termina
-                threads.append(thread) # Guardar el hilo en la lista
-                thread.start() # Iniciar el hilo
-                logger.info(f"[{symbol}] Worker thread iniciado.")
-                time.sleep(0.5) # Pequeña pausa para evitar rate limits al iniciar muchos workers
-            except (ValueError, ConnectionError) as init_error:
-                 logger.error(f"No se pudo inicializar el worker para {symbol}: {init_error}. Saltando este símbolo.")
-            except Exception as thread_error:
-                 logger.error(f"Error inesperado al crear/iniciar worker para {symbol}: {thread_error}.", exc_info=True)
+            # La creación de la instancia de TradingBot ahora está DENTRO de run_bot_worker
+            # Solo creamos e iniciamos el hilo aquí.
+            thread = threading.Thread(target=run_bot_worker, args=(symbol, trading_params, stop_event), name=f"Worker-{symbol}")
+            thread.daemon = True # Marcar como daemon para que no impidan salir si el principal termina
+            threads.append(thread) # Guardar el hilo en la lista
+            thread.start() # Iniciar el hilo
+            # No hay log de "iniciado" aquí, se hace dentro del worker si tiene éxito
+            time.sleep(0.5) # Pequeña pausa para evitar rate limits al iniciar muchos workers
 
-        # 7. Mantener el hilo principal vivo y esperar la señal de parada
+        # 8. Mantener el hilo principal vivo y esperar la señal de parada
         logger.info(f"Todos los workers iniciados ({len(threads)} activos). El proceso principal esperará la señal de parada.")
         while not stop_event.is_set():
             # Esperar indefinidamente hasta que stop_event se active por la señal

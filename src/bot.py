@@ -3,8 +3,9 @@
 
 import time
 import pandas as pd
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import math
+from enum import Enum # <-- Importar Enum
 
 # Importamos los módulos que hemos creado
 # from .config_loader import load_config # No se usa directamente aquí ahora
@@ -20,7 +21,22 @@ from .binance_client import (
     cancel_futures_order
 )
 from .rsi_calculator import calculate_rsi
-from .database import init_db_pool, init_db_schema, record_trade # DB funcs son globales
+from .database import init_db_schema, record_trade # Importamos solo las necesarias
+
+# --- Definición de Estados del Bot ---
+class BotState(Enum):
+    INITIALIZING = "Initializing"
+    IDLE = "Idle (Waiting Cycle)"
+    FETCHING_DATA = "Fetching Market Data"
+    CHECKING_CONDITIONS = "Checking Entry/Exit Conditions"
+    PLACING_ENTRY = "Placing Entry Order"
+    WAITING_ENTRY_FILL = "Waiting Entry Order Fill"
+    IN_POSITION = "In Position"
+    PLACING_EXIT = "Placing Exit Order"
+    WAITING_EXIT_FILL = "Waiting Exit Order Fill"
+    CANCELING_ORDER = "Canceling Order"
+    ERROR = "Error State"
+# ------------------------------------
 
 class TradingBot:
     """
@@ -30,18 +46,27 @@ class TradingBot:
     Ahora usa órdenes LIMIT.
     """
     def __init__(self, symbol: str, trading_params: dict):
-        """Inicializa el bot para un símbolo específico con parámetros dados."""
+        """
+        Inicializa el bot para un símbolo específico.
+        Lee parámetros, inicializa el cliente, obtiene información del símbolo y estado inicial.
+        """
         self.symbol = symbol.upper()
-        self.params = trading_params # Guardar los parámetros específicos
-        self.logger = get_logger() # Obtener el logger global configurado
-        self.client = get_futures_client() # Obtener (o crear) instancia compartida del cliente
-
-        if not self.client:
-            # Log crítico y excepción si no hay cliente
-            self.logger.critical(f"[{self.symbol}] Fallo al obtener el cliente UMFutures. No se puede inicializar worker para este símbolo.")
-            raise ConnectionError(f"Cliente Binance no disponible para {self.symbol}")
-
+        self.logger = get_logger()
+        self.params = trading_params # <-- STORE the params dictionary
         self.logger.info(f"[{self.symbol}] Inicializando worker con parámetros: {self.params}")
+
+        # --- Estado Interno ---
+        self.current_state = BotState.INITIALIZING # Estado inicial
+        self.last_error_message = None # Para guardar el último error
+        # ---------------------
+
+        # Cliente Binance (se inicializa una vez por bot)
+        self.client = get_futures_client()
+        if not self.client:
+            # Error crítico si no se puede inicializar el cliente
+            self._set_error_state("Failed to initialize Binance client.")
+            # Lanzar una excepción para detener la inicialización de este worker
+            raise ConnectionError("Failed to initialize Binance client for worker.")
 
         # Extraer parámetros necesarios de self.params (usando .get con defaults)
         try:
@@ -111,7 +136,14 @@ class TradingBot:
         self.pending_order_timestamp = None # Guarda el time.time() cuando se creó la orden pendiente
         # --------------------------------------------------
         
+        self.last_known_pnl = None # <-- Initialize PnL attribute
+        
         self._check_initial_position() # Llama a get_futures_position con self.symbol
+
+        # Si todo fue bien hasta aquí, el worker está listo para el primer ciclo
+        if self.current_state == BotState.INITIALIZING: # Solo cambia si no hubo error
+             # El estado se actualizará al inicio de run_once
+             pass # Se pondrá en IDLE o similar al empezar el ciclo.
 
         self.logger.info(f"[{self.symbol}] Worker inicializado exitosamente (Timeout Órdenes: {self.order_timeout_seconds}s).")
 
@@ -122,9 +154,10 @@ class TradingBot:
         if position_data:
             pos_amt = Decimal(position_data.get('positionAmt', '0'))
             entry_price = Decimal(position_data.get('entryPrice', '0'))
+            unrealized_pnl = Decimal(position_data.get('unRealizedProfit', '0'))
             if abs(pos_amt) > Decimal('1e-9'):
                  if pos_amt > 0: # Solo LONG
-                     self.logger.warning(f"[{self.symbol}] ¡Posición LONG existente encontrada! Cantidad: {pos_amt}, Precio Entrada: {entry_price}")
+                     self.logger.warning(f"[{self.symbol}] ¡Posición LONG existente encontrada! Cantidad: {pos_amt}, Precio Entrada: {entry_price}, PnL Inicial: {unrealized_pnl}")
                      self.in_position = True
                      self.current_position = {
                          'entry_price': entry_price,
@@ -133,17 +166,32 @@ class TradingBot:
                          'position_size_usdt': abs(pos_amt * entry_price),
                          'positionAmt': pos_amt
                      }
+                     self.last_known_pnl = unrealized_pnl
                  else:
                       self.logger.warning(f"[{self.symbol}] ¡Posición SHORT existente encontrada! Cantidad: {pos_amt}. Este bot no maneja SHORTs.")
+                      # Even if SHORT, reset PnL state if bot thought it was LONG
+                      if self.in_position:
+                          self._reset_state() # Reset state if found SHORT but thought LONG
             else:
-                self.logger.info(f"[{self.symbol}] No hay posición abierta inicialmente.")
+                self.logger.info(f"[{self.symbol}] No hay posición abierta inicialmente (PosAmt ~ 0).")
+                # Ensure state consistency if bot thought it was in position
+                if self.in_position: 
+                     self._reset_state()
+                else:
+                    # Ensure these are None if no position
+                    self.in_position = False
+                    self.current_position = None
+                    self.last_known_pnl = None
+        else:
+            # Could not get position info or no position exists
+            self.logger.info(f"[{self.symbol}] No se pudo obtener información de posición inicial o no existe.")
+            # Ensure state consistency
+            if self.in_position:
+                self._reset_state()
+            else:
                 self.in_position = False
                 self.current_position = None
-        else:
-            # Puede que no haya posición o que haya un error de API leve
-            self.logger.info(f"[{self.symbol}] No se pudo obtener información de posición inicial o no existe.")
-            self.in_position = False
-            self.current_position = None
+                self.last_known_pnl = None
 
         # Asegurarse de que no hay órdenes pendientes si encontramos una posición inicial
         if self.in_position:
@@ -165,352 +213,461 @@ class TradingBot:
         self.logger.debug(f"[{self.symbol}] Precio original: {price}, Tick Size: {self.price_tick_size}, Precio ajustado: {adjusted_price}")
         return float(adjusted_price)
 
+    # --- Method to calculate Volume SMA --- ADDED
+    def _calculate_volume_sma(self, klines: pd.DataFrame):
+        """Calculates the Simple Moving Average (SMA) of the volume and returns relevant values."""
+        if klines is None or klines.empty or 'volume' not in klines.columns:
+            self.logger.warning(f"[{self.symbol}] Invalid klines DataFrame or missing 'volume' column for SMA calculation.")
+            return None
+
+        try:
+            # Ensure volume is numeric, coercing errors to NaN
+            klines['volume'] = pd.to_numeric(klines['volume'], errors='coerce')
+            
+            # Calculate Volume SMA using the period defined in parameters
+            # min_periods=1 allows calculation even with fewer data points than the window at the start
+            volume_sma = klines['volume'].rolling(window=self.volume_sma_period, min_periods=1).mean()
+
+            if volume_sma.empty:
+                 self.logger.warning(f"[{self.symbol}] Volume SMA calculation resulted in an empty Series.")
+                 return None
+                 
+            # Get the latest volume and its corresponding SMA value
+            # We compare the last volume bar with the SMA calculated up to that point
+            current_volume = klines['volume'].iloc[-1]
+            average_volume = volume_sma.iloc[-1] # Use the last calculated SMA
+
+            # Check for NaN values resulting from coercion or calculation
+            if pd.isna(current_volume) or pd.isna(average_volume):
+                self.logger.warning(f"[{self.symbol}] Current volume ({current_volume}) or Volume SMA ({average_volume}) is NaN.")
+                return None
+
+            # Return the values needed for the entry condition check
+            # The entry condition uses: current_volume > average_volume * volume_factor
+            self.logger.debug(f"[{self.symbol}] Volume Check: Current={current_volume:.2f}, Avg({self.volume_sma_period})={average_volume:.2f}, Factor={self.volume_factor}")
+            return current_volume, average_volume, self.volume_factor
+
+        except Exception as e:
+            self.logger.error(f"[{self.symbol}] Error calculating Volume SMA: {e}", exc_info=True)
+            return None
+    # --- End of added method ---
+
     def run_once(self):
         """
         Ejecuta un ciclo de la lógica del bot para self.symbol.
-        Ahora maneja órdenes LIMIT y su estado pendiente/timeout.
+        Ahora maneja órdenes LIMIT, su estado pendiente/timeout y actualiza self.current_state.
         """
-        self.logger.debug(f"--- [{self.symbol}] Iniciando ciclo ({time.strftime('%Y-%m-%d %H:%M:%S')}) --- ")
+        try:
+            # Estado inicial del ciclo (si no hay orden pendiente o error)
+            if not self.pending_entry_order_id and not self.pending_exit_order_id and self.current_state != BotState.ERROR:
+                self._update_state(BotState.IDLE)
 
-        # --- 1. MANEJAR ÓRDENES PENDIENTES --- 
-        # Primero, verificar si tenemos una orden de entrada pendiente
-        if self.pending_entry_order_id:
-            order_info = get_order_status(self.symbol, self.pending_entry_order_id)
-            if order_info:
-                status = order_info.get('status')
-                self.logger.info(f"[{self.symbol}] Verificando orden de ENTRADA pendiente ID {self.pending_entry_order_id}. Estado: {status}")
+            self.logger.debug(f"--- [{self.symbol}] Iniciando ciclo (Estado: {self.current_state.value}) ({time.strftime('%Y-%m-%d %H:%M:%S')}) --- ")
 
-                if status == 'FILLED':
-                    filled_qty = Decimal(order_info.get('executedQty', '0'))
-                    avg_price = Decimal(order_info.get('avgPrice', '0')) # Usar avgPrice para precio real
-                    # Obtener timestamp de la actualización de la orden
-                    update_time_ms = order_info.get('updateTime', 0)
-                    entry_timestamp = pd.Timestamp(update_time_ms, unit='ms', tz='UTC') if update_time_ms else pd.Timestamp.now(tz='UTC')
-                    
-                    self.logger.warning(f"[{self.symbol}] ¡Orden LIMIT BUY {self.pending_entry_order_id} COMPLETADA! Qty: {filled_qty}, Precio Prom: {avg_price:.4f}")
-                    self.in_position = True
-                    self.current_position = {
-                        'entry_price': avg_price,
-                        'quantity': filled_qty,
-                        'entry_time': entry_timestamp,
-                        'position_size_usdt': abs(avg_price * filled_qty),
-                        'positionAmt': filled_qty # Guardar como Decimal si es posible
-                    }
-                    self.pending_entry_order_id = None
-                    self.pending_order_timestamp = None
-                    # No necesitamos hacer nada más en este ciclo, ya entramos
-                    self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Entrada completada) ---")
-                    return 
-                
-                elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
-                    self.logger.warning(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} falló o fue cancelada. Estado: {status}. Reevaluando condiciones...")
-                    self.pending_entry_order_id = None
-                    self.pending_order_timestamp = None
-                    # Continuar el ciclo para reevaluar entrada
-                
-                elif status in ['NEW', 'PARTIALLY_FILLED']:
-                    # Verificar timeout si está habilitado (> 0)
-                    if self.order_timeout_seconds > 0 and self.pending_order_timestamp:
-                        elapsed_time = time.time() - self.pending_order_timestamp
-                        if elapsed_time > self.order_timeout_seconds:
-                            self.logger.warning(f"[{self.symbol}] Timeout ({elapsed_time:.1f}s > {self.order_timeout_seconds}s) alcanzado para orden LIMIT BUY {self.pending_entry_order_id}. Cancelando...")
-                            cancel_response = cancel_futures_order(self.symbol, self.pending_entry_order_id)
-                            if cancel_response:
-                                self.logger.info(f"[{self.symbol}] Orden {self.pending_entry_order_id} cancelada exitosamente.")
+            # --- 0. Recuperación de Errores (Simple) ---
+            # Si estamos en estado de error, intentamos resetear y continuar (podría mejorarse)
+            if self.current_state == BotState.ERROR:
+                 self.logger.warning(f"[{self.symbol}] Intentando recuperarse del estado de ERROR. Reseteando...")
+                 self._reset_state() # Intenta resetear variables internas
+                 # Volvemos a IDLE para re-evaluar todo
+                 self._update_state(BotState.IDLE)
+                 # Podríamos añadir un reintento o lógica más compleja aquí.
+
+            # --- 1. MANEJAR ÓRDENES PENDIENTES --- 
+            # (Verificar estado, manejar llenado o timeout)
+
+            # 1.1 Orden de ENTRADA pendiente
+            if self.pending_entry_order_id:
+                self._update_state(BotState.WAITING_ENTRY_FILL)
+                order_info = get_order_status(self.symbol, self.pending_entry_order_id)
+                if order_info:
+                    status = order_info.get('status')
+                    self.logger.info(f"[{self.symbol}] Verificando orden de ENTRADA pendiente ID {self.pending_entry_order_id}. Estado: {status}")
+
+                    if status == 'FILLED':
+                        filled_qty = Decimal(order_info.get('executedQty', '0'))
+                        avg_price = Decimal(order_info.get('avgPrice', '0'))
+                        update_time_ms = order_info.get('updateTime', 0)
+                        entry_timestamp = pd.Timestamp(update_time_ms, unit='ms', tz='UTC') if update_time_ms else pd.Timestamp.now(tz='UTC')
+                        
+                        self.logger.info(f"[{self.symbol}] ¡Orden LIMIT BUY {self.pending_entry_order_id} COMPLETADA! Qty: {filled_qty}, Precio Prom: {avg_price:.{self.qty_precision}f}")
+
+                        # --- Registrar en DB --- 
+                        trade_data_entry = {
+                            'symbol': self.symbol,
+                            'trade_type': 'LONG', 
+                            'side': 'BUY', 
+                            'entry_timestamp': entry_timestamp, 
+                            'entry_price': avg_price,
+                            'quantity': filled_qty,
+                            'position_size_usdt': avg_price * filled_qty, 
+                            'order_details': order_info, 
+                            'reason': 'limit_order_filled',
+                            'parameters': self.params # <-- Use the stored self.params
+                        }
+                        try:
+                            record_trade(**trade_data_entry)
+                            self.logger.info(f"[{self.symbol}] Trade de ENTRADA registrado en la base de datos.")
+                        except Exception as db_err:
+                            self.logger.error(f"[{self.symbol}] Fallo CRÍTICO al registrar trade de ENTRADA en DB: {db_err}", exc_info=True)
+                            self._set_error_state(f"DB error on entry record: {db_err}")
+
+                        # Update internal bot state
+                        self.in_position = True
+                        # Ensure current_position is a dict before assigning
+                        self.current_position = { 
+                            'entry_price': avg_price,
+                            'quantity': filled_qty,
+                            'entry_time': entry_timestamp,
+                            'position_size_usdt': abs(filled_qty * avg_price), 
+                            'positionAmt': filled_qty 
+                        }
+                        # Guardamos el ID por si necesitamos referenciarlo (aunque no se usa activamente ahora)
+                        # self.last_entry_order_id = self.pending_entry_order_id 
+                        
+                        # Limpiar estado de orden pendiente
+                        self.pending_entry_order_id = None
+                        self.pending_order_timestamp = None
+                        # No necesitamos hacer nada más en este ciclo, ya entramos
+                        self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Entrada completada) ---")
+                        self._update_state(BotState.IN_POSITION) # ¡Ahora estamos en posición!
+
+                    elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
+                        self.logger.warning(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} falló (Estado: {status}). Reseteando.")
+                        self._reset_state()
+                        self._update_state(BotState.IDLE) # Volver a buscar entrada
+
+                    elif status == 'NEW' or status == 'PARTIALLY_FILLED':
+                        # Verificar timeout si la orden sigue activa
+                        if self.order_timeout_seconds > 0 and self.pending_order_timestamp:
+                            elapsed_time = (time.time() - self.pending_order_timestamp)
+                            if elapsed_time > self.order_timeout_seconds:
+                                self.logger.warning(f"[{self.symbol}] Timeout ({elapsed_time:.1f}s > {self.order_timeout_seconds}s) alcanzado para orden LIMIT BUY {self.pending_entry_order_id}. Cancelando...")
+                                self._update_state(BotState.CANCELING_ORDER)
+                                cancel_success = cancel_futures_order(self.symbol, self.pending_entry_order_id)
+                                if cancel_success:
+                                    self.logger.info(f"[{self.symbol}] Orden {self.pending_entry_order_id} cancelada exitosamente.")
+                                    self._reset_state()
+                                    self._update_state(BotState.IDLE) # Volver a buscar
+                                else:
+                                    self.logger.error(f"[{self.symbol}] Fallo al cancelar orden {self.pending_entry_order_id} tras timeout.")
+                                    # Podríamos entrar en estado ERROR o reintentar cancelación?
+                                    self._set_error_state(f"Failed to cancel order {self.pending_entry_order_id} after timeout.")
                             else:
-                                self.logger.error(f"[{self.symbol}] Fallo al cancelar orden {self.pending_entry_order_id}. Puede que ya no exista.")
-                            # Limpiar estado pendiente independientemente del resultado de cancelación
-                            self.pending_entry_order_id = None
-                            self.pending_order_timestamp = None
-                            # Continuar el ciclo para reevaluar
+                                # Aún no hay timeout, seguir esperando
+                                self.logger.info(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} aún pendiente ({status}). Esperando... ({elapsed_time:.1f}s / {self.order_timeout_seconds}s)")
+                                self._update_state(BotState.WAITING_ENTRY_FILL) # Mantener estado
                         else:
-                            self.logger.info(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} aún pendiente ({status}). Esperando... ({elapsed_time:.1f}s / {self.order_timeout_seconds}s)")
-                            # No hacer nada más, esperar al siguiente ciclo
-                            self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Esperando entrada pendiente) ---")
-                            return
-                    else: # Timeout deshabilitado o timestamp no disponible
-                         self.logger.info(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} aún pendiente ({status}). Esperando (sin timeout)... ")
-                         self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Esperando entrada pendiente) ---")
-                         return
-                else: # Otro estado inesperado?
-                    self.logger.error(f"[{self.symbol}] Estado inesperado '{status}' para orden pendiente {self.pending_entry_order_id}. Limpiando.")
-                    self.pending_entry_order_id = None
-                    self.pending_order_timestamp = None
-                    # Continuar ciclo
-            else: # Error al obtener el estado de la orden
-                 self.logger.warning(f"[{self.symbol}] No se pudo obtener estado para orden BUY pendiente {self.pending_entry_order_id}. Podría no existir. Limpiando.")
-                 self.pending_entry_order_id = None
-                 self.pending_order_timestamp = None
-                 # Continuar ciclo
+                             # Timeout deshabilitado (0) o timestamp no establecido
+                             self.logger.info(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} aún pendiente ({status}). Esperando indefinidamente (Timeout={self.order_timeout_seconds}s).")
+                             self._update_state(BotState.WAITING_ENTRY_FILL)
 
-        # Luego, verificar si tenemos una orden de salida pendiente
-        elif self.pending_exit_order_id:
-            order_info = get_order_status(self.symbol, self.pending_exit_order_id)
-            if order_info:
-                status = order_info.get('status')
-                self.logger.info(f"[{self.symbol}] Verificando orden de SALIDA pendiente ID {self.pending_exit_order_id}. Estado: {status}")
+                else:
+                    # Fallo al obtener estado de la orden
+                    self.logger.error(f"[{self.symbol}] No se pudo obtener el estado de la orden de entrada pendiente ID {self.pending_entry_order_id}. Reintentando en el próximo ciclo.")
+                    # No cambiamos el estado, reintentará leerlo
+                    # Considerar un contador de reintentos aquí?
+                    self._update_state(BotState.WAITING_ENTRY_FILL) # O podríamos ir a ERROR? Por ahora reintenta.
                 
-                if status == 'FILLED':
-                    filled_qty = Decimal(order_info.get('executedQty', '0'))
-                    avg_price = Decimal(order_info.get('avgPrice', '0'))
-                    update_time_ms = order_info.get('updateTime', 0)
-                    close_timestamp = pd.Timestamp(update_time_ms, unit='ms', tz='UTC') if update_time_ms else pd.Timestamp.now(tz='UTC')
-                    close_reason = order_info.get('closePosition', False) # No tenemos la razón original, podemos intentar inferirla o usar 'limit_exit'
-                    
-                    self.logger.warning(f"[{self.symbol}] ¡Orden LIMIT SELL {self.pending_exit_order_id} COMPLETADA! Qty: {filled_qty}, Precio Prom: {avg_price:.4f}")
-                    # Llamar a handle_successful_closure para registrar y resetear TODO el estado
-                    # Le pasamos los datos reales de la orden completada
-                    self._handle_successful_closure(
-                        close_price=avg_price, 
-                        quantity_closed=filled_qty,
-                        reason='limit_order_filled', # Razón genérica para salida LIMIT
-                        close_timestamp=close_timestamp
-                    )
-                    # _handle_successful_closure ya limpia los IDs pendientes via _reset_state()
-                    # No necesitamos hacer nada más en este ciclo, ya salimos
-                    self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Salida completada) ---")
+                # Si aún hay una orden de entrada pendiente, no hacemos nada más este ciclo
+                if self.pending_entry_order_id:
                     return
-                
-                elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
-                    self.logger.warning(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} falló o fue cancelada. Estado: {status}. Reevaluando condiciones de salida...")
-                    self.pending_exit_order_id = None
-                    self.pending_order_timestamp = None
-                    # Continuar el ciclo para reevaluar salida
-                
-                elif status in ['NEW', 'PARTIALLY_FILLED']:
-                     # Verificar timeout
-                    if self.order_timeout_seconds > 0 and self.pending_order_timestamp:
-                        elapsed_time = time.time() - self.pending_order_timestamp
-                        if elapsed_time > self.order_timeout_seconds:
-                            self.logger.warning(f"[{self.symbol}] Timeout ({elapsed_time:.1f}s > {self.order_timeout_seconds}s) alcanzado para orden LIMIT SELL {self.pending_exit_order_id}. Cancelando...")
-                            cancel_response = cancel_futures_order(self.symbol, self.pending_exit_order_id)
-                            if cancel_response:
-                                self.logger.info(f"[{self.symbol}] Orden {self.pending_exit_order_id} cancelada exitosamente.")
-                            else:
-                                self.logger.error(f"[{self.symbol}] Fallo al cancelar orden {self.pending_exit_order_id}.")
-                            self.pending_exit_order_id = None
-                            self.pending_order_timestamp = None
-                            # Continuar el ciclo para reevaluar
-                        else:
-                            self.logger.info(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} aún pendiente ({status}). Esperando... ({elapsed_time:.1f}s / {self.order_timeout_seconds}s)")
-                            self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Esperando salida pendiente) ---")
-                            return
-                    else: # Timeout 0
-                        self.logger.info(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} aún pendiente ({status}). Esperando (sin timeout)... ")
-                        self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Esperando salida pendiente) ---")
-                        return
-                else: # Estado inesperado
-                    self.logger.error(f"[{self.symbol}] Estado inesperado '{status}' para orden de salida pendiente {self.pending_exit_order_id}. Limpiando.")
-                    self.pending_exit_order_id = None
-                    self.pending_order_timestamp = None
-                    # Continuar ciclo
-            else: # Error al obtener estado
-                self.logger.warning(f"[{self.symbol}] No se pudo obtener estado para orden SELL pendiente {self.pending_exit_order_id}. Limpiando.")
-                self.pending_exit_order_id = None
-                self.pending_order_timestamp = None
-                # Continuar ciclo
 
-        # --- FIN MANEJO ÓRDENES PENDIENTES ---
+            # 1.2 Orden de SALIDA pendiente
+            elif self.pending_exit_order_id:
+                self._update_state(BotState.WAITING_EXIT_FILL)
+                order_info = get_order_status(self.symbol, self.pending_exit_order_id)
+                if order_info:
+                    status = order_info.get('status')
+                    self.logger.info(f"[{self.symbol}] Verificando orden de SALIDA pendiente ID {self.pending_exit_order_id}. Estado: {status}")
 
-        # --- 2. SI NO HAY ÓRDENES PENDIENTES, PROCEDER CON LÓGICA NORMAL --- 
+                    if status == 'FILLED':
+                        filled_qty = Decimal(order_info.get('executedQty', '0'))
+                        avg_price = Decimal(order_info.get('avgPrice', '0'))
+                        update_time_ms = order_info.get('updateTime', 0)
+                        exit_timestamp = pd.Timestamp(update_time_ms, unit='ms', tz='UTC') if update_time_ms else pd.Timestamp.now(tz='UTC')
 
-        # Verificar estado real de la posición (importante si una orden se llenó sin detectarlo o hubo cierre manual)
-        live_position_data = get_futures_position(self.symbol)
-        live_pos_amt = Decimal('0')
-        live_entry_price = Decimal('0')
-        if live_position_data:
-            live_pos_amt = Decimal(live_position_data.get('positionAmt', '0'))
-            live_entry_price = Decimal(live_position_data.get('entryPrice', '0'))
-
-        # Actualizar estado interno basado en la información real
-        was_in_position = self.in_position # Guardar estado previo
-        should_be_in_position = abs(live_pos_amt) > Decimal('1e-9') and live_pos_amt > 0 # Solo LONG
-        
-        if should_be_in_position and not self.in_position:
-             # Entramos en posición sin tenerlo registrado (quizás orden llenada entre ciclos)
-             self.logger.warning(f"[{self.symbol}] Detectada posición LONG en Binance ({live_pos_amt}) no registrada internamente. Actualizando estado.")
-             self.in_position = True
-             self.current_position = {
-                'entry_price': live_entry_price,
-                'quantity': live_pos_amt,
-                'entry_time': pd.Timestamp.now(tz='UTC'), # Placeholder, idealmente obtener de la orden llenada
-                'position_size_usdt': abs(live_pos_amt * live_entry_price),
-                'positionAmt': live_pos_amt
-             }
-        elif not should_be_in_position and self.in_position:
-             # Salimos de posición sin tenerlo registrado (manual, SL/TP server, orden llenada...)
-             self.logger.warning(f"[{self.symbol}] Binance indica que no hay posición, pero el bot la tenía registrada. Reseteando estado.")
-             # No podemos registrar trade aquí si no sabemos cómo se cerró
-             self._reset_state()
-             was_in_position = False # Actualizar para lógica posterior
-        elif should_be_in_position and self.in_position:
-             # Actualizar datos de la posición existente si es necesario
-             self.current_position['quantity'] = live_pos_amt
-             self.current_position['entry_price'] = live_entry_price
-             self.current_position['positionAmt'] = live_pos_amt
-        
-        # Ahora self.in_position refleja el estado real más reciente
-
-        # Obtener Datos Históricos y Calcular Indicadores
-        klines_df = get_historical_klines(self.symbol, self.rsi_interval, limit=max(self.rsi_period + 10, self.volume_sma_period + 10))
-        if klines_df is None or klines_df.empty:
-            self.logger.error(f"[{self.symbol}] No se pudieron obtener datos de klines. Saltando ciclo.")
-            self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Error klines) ---")
-            return
-        
-        # Calcular Volumen y RSI (código existente)
-        volume_filter_enabled = True
-        current_volume = Decimal('0')
-        average_volume = Decimal('NaN') # Usar NaN como default
-        if 'Volume' not in klines_df.columns:
-             self.logger.error(f"[{self.symbol}] Columna 'Volume' no encontrada. Filtro de volumen deshabilitado.")
-             volume_filter_enabled = False
-        else:
-             klines_df['Volume_SMA'] = klines_df['Volume'].rolling(window=self.volume_sma_period, min_periods=self.volume_sma_period).mean()
-             current_volume = Decimal(str(klines_df['Volume'].iloc[-1])) # Convertir a Decimal
-             # Manejar posible NaN en SMA
-             avg_vol_raw = klines_df['Volume_SMA'].iloc[-1]
-             average_volume = Decimal(str(avg_vol_raw)) if pd.notna(avg_vol_raw) else Decimal('NaN')
-             avg_vol_str = f"{average_volume:.2f}" if not average_volume.is_nan() else 'N/A'
-             self.logger.debug(f"[{self.symbol}] Vol Actual: {current_volume:.2f}, Vol SMA({self.volume_sma_period}): {avg_vol_str}, Factor: {self.volume_factor}")
-
-        rsi_series = calculate_rsi(klines_df['Close'], period=self.rsi_period)
-        if rsi_series is None or rsi_series.empty or len(rsi_series) < 2:
-            self.logger.warning(f"[{self.symbol}] No hay suficientes datos de RSI. Esperando...")
-            self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Datos RSI insuficientes) ---")
-            return
-            
-        current_rsi = rsi_series.iloc[-1]
-        previous_rsi = rsi_series.iloc[-2]
-        if pd.isna(current_rsi) or pd.isna(previous_rsi):
-            self.logger.warning(f"[{self.symbol}] RSI actual o previo es NaN. Esperando...")
-            self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (RSI NaN) ---")
-            return
-            
-        rsi_change = current_rsi - previous_rsi
-        self.logger.info(f"[{self.symbol}] RSI actual: {current_rsi:.2f}, Cambio: {rsi_change:.2f}, Entry Level: {self.rsi_entry_level_low:.2f}")
-        self.last_rsi_value = current_rsi
-        latest_close_price = Decimal(str(klines_df['Close'].iloc[-1]))
-
-        # --- 3. LÓGICA DE ENTRADA/SALIDA con ÓRDENES LIMIT --- 
-
-        # A. Lógica de ENTRADA (Si NO estamos en posición Y NO hay orden de entrada pendiente)
-        if not self.in_position and not self.pending_entry_order_id:
-            rsi_condition_met = rsi_change >= self.rsi_threshold_up and current_rsi < self.rsi_entry_level_low
-            volume_condition_met = False
-            if volume_filter_enabled and not average_volume.is_nan() and average_volume > 0:
-                volume_condition_met = current_volume > (average_volume * Decimal(str(self.volume_factor)))
-            elif not volume_filter_enabled:
-                volume_condition_met = True
-                
-            if rsi_condition_met and volume_condition_met:
-                self.logger.warning(f"[{self.symbol}] CONDICIÓN DE ENTRADA LONG CUMPLIDA (RSI + Volumen). Intentando colocar orden LIMIT BUY...")
-                # Obtener Bid actual
-                ticker_info = get_order_book_ticker(self.symbol)
-                if ticker_info and 'bidPrice' in ticker_info:
-                    bid_price = Decimal(ticker_info['bidPrice'])
-                    if bid_price > 0:
-                        limit_buy_price = bid_price # Usar Bid como precio límite
-                        adjusted_buy_price = self._adjust_price(limit_buy_price)
+                        self.logger.warning(f"[{self.symbol}] ¡Orden LIMIT SELL {self.pending_exit_order_id} COMPLETADA! Qty: {filled_qty}, Precio Prom: {avg_price:.{self.qty_precision}f}")
                         
-                        desired_quantity = self.position_size_usdt / Decimal(str(adjusted_buy_price)) # Usar precio ajustado para calcular qty
-                        adjusted_quantity = self._adjust_quantity(desired_quantity)
-                        
-                        if adjusted_quantity > 0:
-                            self.logger.info(f"[{self.symbol}] Calculado: Precio LIMIT BUY={adjusted_buy_price:.4f}, Cantidad={adjusted_quantity:.8f}")
-                            buy_order = create_futures_limit_order(
-                                symbol=self.symbol,
-                                side='BUY',
-                                quantity=adjusted_quantity,
-                                price=adjusted_buy_price
-                            )
-                            if buy_order and buy_order.get('orderId'):
-                                self.pending_entry_order_id = buy_order['orderId']
-                                self.pending_order_timestamp = time.time()
-                                self.logger.warning(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} colocada @ {adjusted_buy_price:.4f}. Esperando ejecución...")
-                                # Salir del ciclo actual, se manejará en el siguiente
-                                self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Orden entrada colocada) ---")
-                                return
-                            else:
-                                self.logger.error(f"[{self.symbol}] Fallo al crear la orden LIMIT BUY.")
-                                # Continuar para posible reintento en el siguiente ciclo
+                        # Calcular PnL final (puede ser aproximado si hubo fees)
+                        final_pnl = (avg_price - self.current_position['entry_price']) * filled_qty
+                        self.logger.info(f"[{self.symbol}] Registrando cierre de posición: Razón=limit_order_filled, PnL Final={final_pnl:.4f} USDT")
+
+                        # --- Registrar en DB --- 
+                        # Ensure we have current position data before accessing it
+                        if self.current_position:
+                            trade_data_exit = {
+                                'symbol': self.symbol,
+                                'trade_type': 'LONG', 
+                                'side': 'SELL', 
+                                'open_timestamp': self.current_position.get('entry_time'), # <-- ADDED from current position
+                                'open_price': self.current_position.get('entry_price'),     # <-- ADDED from current position
+                                'exit_timestamp': exit_timestamp,
+                                'exit_price': avg_price,
+                                'quantity': filled_qty,
+                                'position_size_usdt': self.current_position.get('position_size_usdt'), # Use original size
+                                'pnl_usdt': final_pnl,
+                                'close_reason': 'limit_order_filled', # O la razón que disparó la salida
+                                'order_details': order_info,
+                                'parameters': self.params
+                            }
+                            try:
+                                record_trade(**trade_data_exit)
+                                self.logger.info(f"[{self.symbol}] Trade de SALIDA registrado en la base de datos.") # Log success
+                            except Exception as db_err:
+                                self.logger.error(f"[{self.symbol}] Fallo CRÍTICO al registrar trade de SALIDA en DB: {db_err}", exc_info=True)
+                                self._set_error_state(f"DB error on exit record: {db_err}")
                         else:
-                            self.logger.error(f"[{self.symbol}] Cantidad ajustada para BUY es <= 0. No se puede crear orden.")
-                    else:
-                        self.logger.error(f"[{self.symbol}] Precio Bid inválido ({bid_price}) obtenido. No se puede colocar orden BUY.")
+                             self.logger.error(f"[{self.symbol}] No se encontraron datos de posición actual (self.current_position) al intentar registrar salida en DB.")
+                             # We might still reset state, but logging is crucial
+                        
+                        # Reseteamos estado porque la posición se cerró
+                        self._reset_state()
+                        self._update_state(BotState.IDLE) # Volver a estado base
+
+                    elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
+                        self.logger.warning(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} falló (Estado: {status}). La posición sigue abierta. Reevaluando...")
+                        # La posición sigue abierta, pero la orden falló. Limpiamos la orden pendiente.
+                        self.pending_exit_order_id = None 
+                        self.pending_order_timestamp = None
+                        # Mantenemos in_position = True, se reevaluarán condiciones de salida.
+                        self._update_state(BotState.IN_POSITION) # Volver a estado "en posición"
+
+                    elif status == 'NEW' or status == 'PARTIALLY_FILLED':
+                        # Verificar timeout
+                        if self.order_timeout_seconds > 0 and self.pending_order_timestamp:
+                            elapsed_time = (time.time() - self.pending_order_timestamp)
+                            if elapsed_time > self.order_timeout_seconds:
+                                self.logger.warning(f"[{self.symbol}] Timeout ({elapsed_time:.1f}s > {self.order_timeout_seconds}s) alcanzado para orden LIMIT SELL {self.pending_exit_order_id}. Cancelando...")
+                                self._update_state(BotState.CANCELING_ORDER)
+                                cancel_success = cancel_futures_order(self.symbol, self.pending_exit_order_id)
+                                if cancel_success:
+                                    self.logger.info(f"[{self.symbol}] Orden {self.pending_exit_order_id} cancelada exitosamente. Posición sigue abierta. Reevaluando...")
+                                    self.pending_exit_order_id = None # Limpiar orden pendiente
+                                    self.pending_order_timestamp = None
+                                    self._update_state(BotState.IN_POSITION) # Volver a estado "en posición"
+                                else:
+                                    self.logger.error(f"[{self.symbol}] Fallo al cancelar orden {self.pending_exit_order_id} tras timeout.")
+                                    self._set_error_state(f"Failed to cancel order {self.pending_exit_order_id} after timeout.")
+                            else:
+                                self.logger.info(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} aún pendiente ({status}). Esperando... ({elapsed_time:.1f}s / {self.order_timeout_seconds}s)")
+                                self._update_state(BotState.WAITING_EXIT_FILL)
+                        else:
+                            self.logger.info(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} aún pendiente ({status}). Esperando indefinidamente (Timeout={self.order_timeout_seconds}s).")
+                            self._update_state(BotState.WAITING_EXIT_FILL)
                 else:
-                    self.logger.error(f"[{self.symbol}] No se pudo obtener el ticker (Bid/Ask) para colocar orden BUY.")
-            # Log si condiciones no cumplidas (código existente)
-            elif rsi_condition_met and not volume_condition_met:
-                 volume_threshold_str = f"{(average_volume * Decimal(str(self.volume_factor))):.2f}" if not average_volume.is_nan() else 'N/A'
-                 self.logger.debug(f"[{self.symbol}] Condición RSI entrada OK, pero Volumen NO OK (Vol: {current_volume:.2f}, AvgVol*Factor: {volume_threshold_str}). No se entra.")
+                    self.logger.error(f"[{self.symbol}] No se pudo obtener el estado de la orden de salida pendiente ID {self.pending_exit_order_id}. Reintentando en el próximo ciclo.")
+                    self._update_state(BotState.WAITING_EXIT_FILL) # Reintentará
+
+                # Si aún hay una orden de salida pendiente, no hacemos nada más este ciclo
+                if self.pending_exit_order_id:
+                    return
+
+            # --- 2. OBTENER DATOS Y CALCULAR INDICADORES --- 
+            # (Solo si no hay órdenes pendientes)
+            self._update_state(BotState.FETCHING_DATA) # Estado: obteniendo datos
+            # 2.1 Obtener posición actual (podríamos obtenerla antes o aquí)
+            position_info = get_futures_position(self.symbol)
+            if position_info:
+                 current_pos_qty = Decimal(position_info.get('positionAmt', '0'))
+                 entry_price = Decimal(position_info.get('entryPrice', '0'))
+                 unrealized_pnl = Decimal(position_info.get('unRealizedProfit', '0'))
+                 # Actualizar estado interno si la cantidad es > 0
+                 if current_pos_qty > 0:
+                     # Initialize current_position as dict if bot thinks it's not in position or if it's None
+                     if not self.in_position or self.current_position is None: 
+                         self.logger.warning(f"[{self.symbol}] Detectada posición externa o recuperada: Qty={current_pos_qty}, Entry={entry_price:.{self.qty_precision}f}")
+                         self.current_position = {} # Initialize as an empty dictionary
+                         
+                     self.in_position = True
+                     # Now it's safe to assign keys
+                     self.current_position['quantity'] = current_pos_qty
+                     self.current_position['entry_price'] = entry_price
+                     # Add entry_time if it's missing after recovery (might need adjustment)
+                     if 'entry_time' not in self.current_position:
+                         self.current_position['entry_time'] = pd.Timestamp.now(tz='UTC') # Placeholder time
+                     self.last_known_pnl = unrealized_pnl
+                     if self.current_state not in [BotState.PLACING_EXIT, BotState.WAITING_EXIT_FILL, BotState.CANCELING_ORDER]:
+                          self._update_state(BotState.IN_POSITION) # Marcar estado si no estamos saliendo
+                 else:
+                     # Si la API dice que no hay posición, reseteamos estado interno
+                     if self.in_position:
+                         self.logger.info(f"[{self.symbol}] La API indica que ya no hay posición abierta. Reseteando estado.")
+                         self._reset_state()
+                     self.in_position = False
+                     if self.current_state == BotState.IN_POSITION:
+                           self._update_state(BotState.IDLE)
             else:
-                 self.logger.debug(f"[{self.symbol}] No en posición. Condición RSI entrada no cumplida.")
+                 # Si falla obtener posición, podríamos loguear error pero continuar?
+                 self.logger.error(f"[{self.symbol}] No se pudo obtener información de posición actual.")
+                 # ¿Entrar en ERROR state o asumir no posición?
+                 # Por ahora, asumimos no posición si ya estábamos así, o mantenemos si estábamos IN_POSITION
+                 if not self.in_position and self.current_state != BotState.ERROR:
+                     self._update_state(BotState.IDLE)
+                 elif self.in_position:
+                      self.logger.warning(f"[{self.symbol}] Fallo al obtener datos de posición, pero se asume que sigue activa.")
+                      self._update_state(BotState.IN_POSITION) # Mantener estado
 
-        # B. Lógica de SALIDA (Si SÍ estamos en posición Y NO hay orden de salida pendiente)
-        elif self.in_position and not self.pending_exit_order_id and self.current_position:
-            entry_price_dec = self.current_position['entry_price']
-            quantity_dec = self.current_position['quantity']
-            current_pnl_usdt = (latest_close_price - entry_price_dec) * quantity_dec
-            self.logger.info(f"[{self.symbol}] En posición LONG. Qty={quantity_dec:.8f}, Entry={entry_price_dec:.4f}, "
-                           f"Actual={latest_close_price:.4f}, PnL={current_pnl_usdt:.4f} USDT")
+            # 2.2 Obtener klines y calcular indicadores
+            klines = get_historical_klines(self.symbol, self.rsi_interval, limit=self.rsi_period + self.volume_sma_period + 10) # Pedir suficientes klines
+            if klines.empty:
+                self.logger.warning(f"[{self.symbol}] No se recibieron datos de klines (DataFrame vacío).")
+                return # Exit the function for this run if no klines data
 
-            close_reason = None
-            if rsi_change <= self.rsi_threshold_down:
-                close_reason = 'rsi_threshold'
-            elif self.take_profit_usdt > 0 and current_pnl_usdt >= self.take_profit_usdt:
-                close_reason = 'take_profit'
-            elif self.stop_loss_usdt < 0 and current_pnl_usdt <= self.stop_loss_usdt:
-                close_reason = 'stop_loss'
+            self._update_state(BotState.CHECKING_CONDITIONS) # Estado: analizando datos
+            # Calcular RSI y Volumen SMA
+            # Pass only the 'close' column (Pandas Series) to calculate_rsi
+            rsi_result = calculate_rsi(klines['close'], self.rsi_period)
+            # Call the internal method for volume SMA
+            volume_result = self._calculate_volume_sma(klines)
 
-            if close_reason:
-                self.logger.warning(f"[{self.symbol}] CONDICIÓN DE SALIDA ({close_reason}) CUMPLIDA! Intentando colocar orden LIMIT SELL...")
-                # Obtener Ask actual
-                ticker_info = get_order_book_ticker(self.symbol)
-                if ticker_info and 'askPrice' in ticker_info:
-                    ask_price = Decimal(ticker_info['askPrice'])
-                    if ask_price > 0:
-                        limit_sell_price = ask_price # Usar Ask como precio límite
-                        adjusted_sell_price = self._adjust_price(limit_sell_price)
-                        close_quantity = self._adjust_quantity(abs(quantity_dec)) # Usar la cantidad de la posición
-                        
-                        if close_quantity > 0:
-                            self.logger.info(f"[{self.symbol}] Calculado: Precio LIMIT SELL={adjusted_sell_price:.4f}, Cantidad={close_quantity:.8f}")
-                            sell_order = create_futures_limit_order(
-                                symbol=self.symbol,
-                                side='SELL',
-                                quantity=close_quantity,
-                                price=adjusted_sell_price
-                            )
-                            if sell_order and sell_order.get('orderId'):
-                                self.pending_exit_order_id = sell_order['orderId']
-                                self.pending_order_timestamp = time.time()
-                                self.logger.warning(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} colocada @ {adjusted_sell_price:.4f}. Esperando ejecución...")
-                                # Salir del ciclo actual
-                                self.logger.debug(f"--- [{self.symbol}] Fin de ciclo (Orden salida colocada) ---")
-                                return
-                            else:
-                                self.logger.error(f"[{self.symbol}] Fallo al crear la orden LIMIT SELL.")
-                        else:
-                             self.logger.error(f"[{self.symbol}] Cantidad ajustada para SELL es <= 0. No se puede crear orden.")
+            # Process the RSI result (which is a Pandas Series)
+            if rsi_result is None or rsi_result.empty:
+                self.logger.warning(f"[{self.symbol}] No se pudo calcular el RSI (datos insuficientes o error en cálculo).")
+                return 
+                
+            # Check if we have at least two RSI values to calculate change
+            if len(rsi_result.dropna()) < 2:
+                 self.logger.warning(f"[{self.symbol}] No hay suficientes valores de RSI ({len(rsi_result.dropna())}) para calcular el cambio.")
+                 return
+                 
+            # Get the last two non-NaN RSI values
+            valid_rsi = rsi_result.dropna()
+            current_rsi = valid_rsi.iloc[-1]
+            previous_rsi = valid_rsi.iloc[-2]
+            rsi_change = current_rsi - previous_rsi
+            
+            self.logger.info(f"[{self.symbol}] RSI actual: {current_rsi:.2f}, Cambio: {rsi_change:.2f}, Entry Level: {self.rsi_entry_level_low:.2f}")
+
+            # --- 3. LÓGICA DE ENTRADA / SALIDA --- 
+
+            # 3.1 Lógica de SALIDA (Prioridad si estamos en posición)
+            if self.in_position:
+                self._update_state(BotState.IN_POSITION) # Asegurar estado IN_POSITION
+                # Obtener precio actual (Ask para vender)
+                ticker = get_order_book_ticker(self.symbol)
+                current_ask_price = Decimal(ticker.get('askPrice')) if ticker else None
+                if current_ask_price is None:
+                     self.logger.error(f"[{self.symbol}] No se pudo obtener el precio Ask actual para evaluar salida.")
+                     # ¿Mantener posición o intentar cerrar a mercado? Por ahora, mantenemos.
+                     return
+
+                # Log PnL actual
+                self.last_known_pnl = (current_ask_price - self.current_position['entry_price']) * self.current_position['quantity']
+                self.logger.info(f"[{self.symbol}] En posición LONG. Qty={self.current_position['quantity']}, Entry={self.current_position['entry_price']:.{self.qty_precision}f}, Actual={current_ask_price:.{self.qty_precision}f}, PnL={self.last_known_pnl:.4f} USDT")
+
+                # Evaluar condiciones de salida
+                exit_condition_met = False
+                exit_reason = None
+
+                # Stop Loss
+                if self.stop_loss_usdt < 0 and self.last_known_pnl <= self.stop_loss_usdt:
+                    exit_condition_met = True
+                    exit_reason = "stop_loss"
+                    self.logger.warning(f"[{self.symbol}] CONDICIÓN DE SALIDA (stop_loss) CUMPLIDA! (PnL={self.last_known_pnl:.4f} <= {self.stop_loss_usdt:.4f})")
+                
+                # Take Profit
+                elif self.take_profit_usdt > 0 and self.last_known_pnl >= self.take_profit_usdt:
+                    exit_condition_met = True
+                    exit_reason = "take_profit"
+                    self.logger.warning(f"[{self.symbol}] CONDICIÓN DE SALIDA (take_profit) CUMPLIDA! (PnL={self.last_known_pnl:.4f} >= {self.take_profit_usdt:.4f})")
+                    
+                # Salida por RSI (si el cambio es suficientemente negativo)
+                elif rsi_change < self.rsi_threshold_down:
+                     exit_condition_met = True
+                     exit_reason = "rsi_threshold"
+                     self.logger.warning(f"[{self.symbol}] CONDICIÓN DE SALIDA (rsi_threshold) CUMPLIDA! (Cambio={rsi_change:.2f} < {self.rsi_threshold_down:.2f})")
+
+                # Si se cumple alguna condición de salida, colocar orden LIMIT SELL
+                if exit_condition_met:
+                    self.logger.warning(f"[{self.symbol}] Intentando colocar orden LIMIT SELL para cerrar posición (Razón: {exit_reason})...")
+                    self._update_state(BotState.PLACING_EXIT)
+                    
+                    # Usar Ask Price como base para la orden de venta
+                    limit_sell_price = self._adjust_price(current_ask_price)
+                    quantity_to_sell = self._adjust_quantity(self.current_position['quantity'])
+                    self.logger.info(f"[{self.symbol}] Calculado: Precio LIMIT SELL={limit_sell_price:.{self.qty_precision}f}, Cantidad={quantity_to_sell}")
+                    
+                    order_result = create_futures_limit_order(self.symbol, 'SELL', quantity_to_sell, limit_sell_price)
+                    
+                    if order_result and order_result.get('orderId'):
+                        self.pending_exit_order_id = order_result['orderId']
+                        self.pending_order_timestamp = time.time()
+                        self.logger.warning(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} colocada @ {limit_sell_price:.{self.qty_precision}f}. Esperando ejecución...")
+                        self._update_state(BotState.WAITING_EXIT_FILL)
                     else:
-                        self.logger.error(f"[{self.symbol}] Precio Ask inválido ({ask_price}) obtenido. No se puede colocar orden SELL.")
-                else:
-                     self.logger.error(f"[{self.symbol}] No se pudo obtener el ticker (Bid/Ask) para colocar orden SELL.")
-            else:
-                 self.logger.debug(f"[{self.symbol}] En posición LONG. Condiciones de salida no cumplidas.")
-        
-        elif self.in_position and self.pending_exit_order_id:
-             # Ya estamos manejando la orden de salida pendiente al inicio del ciclo
-             self.logger.debug(f"[{self.symbol}] En posición, pero esperando que la orden de salida {self.pending_exit_order_id} se resuelva.")
-             # No necesitamos hacer nada más aquí
-        
-        # Caso final: No estamos en posición y ya estamos esperando una orden de entrada
-        elif not self.in_position and self.pending_entry_order_id:
-             self.logger.debug(f"[{self.symbol}] No en posición, esperando que la orden de entrada {self.pending_entry_order_id} se resuelva.")
-             # No necesitamos hacer nada más aquí
+                        self.logger.error(f"[{self.symbol}] Fallo al colocar la orden LIMIT SELL para cerrar posición.")
+                        # ¿Qué hacer? Reintentar en el próximo ciclo? Entrar en ERROR?
+                        self._set_error_state(f"Failed to place exit order.")
+                # else:
+                    # No hay condición de salida, seguimos en posición.
+                    # self.logger.debug(f"[{self.symbol}] Manteniendo posición. No hay señal de salida.")
+                    # self._update_state(BotState.IN_POSITION) # Ya debería estar en este estado
 
-        self.logger.debug(f"--- [{self.symbol}] Fin de ciclo --- ")
+            # 3.2 Lógica de ENTRADA (Solo si NO estamos en posición y NO hay orden pendiente)
+            elif not self.in_position:
+                self._update_state(BotState.CHECKING_CONDITIONS) # Estado: buscando entrada
+                # Evaluar condiciones de entrada LONG
+                rsi_entry_cond = (rsi_change > self.rsi_threshold_up) and (current_rsi < self.rsi_entry_level_low)
+                volume_cond = False
+                if volume_result:
+                     current_volume, average_volume, vol_factor = volume_result
+                     volume_cond = current_volume > average_volume * vol_factor
+                     volume_threshold_str = f"{(average_volume * vol_factor):.2f}" if pd.notna(average_volume) else 'N/A'
+                     volume_check_log = f"Vol: {current_volume:.2f}, AvgVol*Factor: {volume_threshold_str}"
+                else:
+                     volume_check_log = "Volumen N/A"
+                     # Si no hay datos de volumen, ¿permitimos entrada o no?
+                     # Por defecto, la haremos más restrictiva: se necesita volumen OK.
+                     volume_cond = False 
+
+                # Loguear chequeo de condiciones
+                if rsi_entry_cond and volume_cond:
+                    self.logger.warning(f"[{self.symbol}] CONDICIÓN DE ENTRADA LONG CUMPLIDA (RSI + Volumen). Intentando colocar orden LIMIT BUY...")
+                    self._update_state(BotState.PLACING_ENTRY)
+                    
+                    # Obtener Bid price para la orden de compra
+                    ticker = get_order_book_ticker(self.symbol)
+                    current_bid_price = Decimal(ticker.get('bidPrice')) if ticker else None
+                    if current_bid_price is None:
+                         self.logger.error(f"[{self.symbol}] No se pudo obtener el precio Bid actual para colocar orden de entrada.")
+                         self._set_error_state("Failed to get Bid price for entry.")
+                         return
+                    
+                    # Calcular cantidad basada en tamaño USDT y precio Bid
+                    entry_quantity_raw = self.position_size_usdt / current_bid_price
+                    entry_quantity = self._adjust_quantity(entry_quantity_raw)
+                    limit_buy_price = self._adjust_price(current_bid_price)
+                    self.logger.info(f"[{self.symbol}] Calculado: Precio LIMIT BUY={limit_buy_price:.{self.qty_precision}f}, Cantidad={entry_quantity}")
+                    
+                    # Colocar orden LIMIT BUY
+                    order_result = create_futures_limit_order(self.symbol, 'BUY', entry_quantity, limit_buy_price)
+                    
+                    if order_result and order_result.get('orderId'):
+                        self.pending_entry_order_id = order_result['orderId']
+                        self.pending_order_timestamp = time.time()
+                        self.logger.warning(f"[{self.symbol}] Orden LIMIT BUY {self.pending_entry_order_id} colocada @ {limit_buy_price:.{self.qty_precision}f}. Esperando ejecución...")
+                        self._update_state(BotState.WAITING_ENTRY_FILL)
+                    else:
+                        self.logger.error(f"[{self.symbol}] Fallo al colocar la orden LIMIT BUY.")
+                        self._set_error_state("Failed to place entry order.")
+                        # ¿Resetear estado o reintentar?
+                        # self._reset_state() 
+                        # self._update_state(BotState.IDLE)
+
+                elif rsi_entry_cond and not volume_cond:
+                     self.logger.debug(f"[{self.symbol}] Condición RSI entrada OK, pero Volumen NO OK ({volume_check_log}). No se entra.")
+                     self._update_state(BotState.IDLE) # Volver a esperar
+                else: # Si RSI no se cumplió (independiente del volumen)
+                     self.logger.debug(f"[{self.symbol}] Condiciones de entrada NO cumplidas (RSI Change: {rsi_change:.2f} vs {self.rsi_threshold_up:.2f}, RSI Level: {current_rsi:.2f} vs {self.rsi_entry_level_low:.2f}).")
+                     self._update_state(BotState.IDLE) # Volver a esperar
+
+        except Exception as e:
+            # Captura general de errores durante el ciclo
+            self.logger.error(f"[{self.symbol}] Error inesperado durante run_once: {e}", exc_info=True)
+            self._set_error_state(f"Unhandled exception: {e}")
+            # Podríamos intentar resetear el estado aquí también
+            # self._reset_state()
 
     def _handle_successful_closure(self, close_price, quantity_closed, reason, close_timestamp=None):
         """
@@ -572,8 +729,8 @@ class TradingBot:
         self._reset_state()
 
     def _reset_state(self):
-        """Resetea las variables de estado interno de la posición y órdenes pendientes."""
-        self.logger.debug(f"[{self.symbol}] Reseteando estado interno completo (posición y órdenes pendientes).")
+        """Resetea el estado relacionado con órdenes pendientes y posición."""
+        self.logger.debug(f"[{self.symbol}] Reseteando estado de orden pendiente/posición.")
         self.in_position = False
         self.current_position = None
         # --- Resetear también estado de órdenes pendientes ---
@@ -582,6 +739,39 @@ class TradingBot:
         self.pending_order_timestamp = None
         # ---------------------------------------------------
         # self.last_rsi_value = None # Podríamos mantenerlo o resetearlo
+
+    # --- Métodos para actualizar estado ---
+    # (Estos se llamarán desde run_once)
+    def _update_state(self, new_state: BotState, error_message: str | None = None):
+        if self.current_state != new_state:
+             self.logger.debug(f"[{self.symbol}] State changed from {self.current_state.value} to {new_state.value}")
+             self.current_state = new_state
+        if new_state == BotState.ERROR and error_message:
+             self.last_error_message = error_message
+             self.logger.error(f"[{self.symbol}] Error detail: {error_message}")
+        elif new_state != BotState.ERROR:
+             self.last_error_message = None # Limpiar mensaje de error si salimos del estado ERROR
+
+    def get_current_status(self) -> dict:
+         """Devuelve el estado actual del bot y datos relevantes."""
+         status_data = {
+             'symbol': self.symbol,
+             'state': self.current_state.value,
+             'in_position': self.in_position,
+             'entry_price': float(self.current_position['entry_price']) if self.in_position else None,
+             'quantity': float(self.current_position['quantity']) if self.in_position else None,
+             'pnl': float(self.last_known_pnl) if self.in_position else None,
+             'pending_entry_order_id': self.pending_entry_order_id,
+             'pending_exit_order_id': self.pending_exit_order_id,
+             'last_error': self.last_error_message
+         }
+         return status_data
+
+    def _set_error_state(self, message: str):
+        """Establece el estado del bot a ERROR y guarda el mensaje."""
+        self.current_state = BotState.ERROR
+        self.last_error_message = message
+        self.logger.error(f"[{self.symbol}] Entering ERROR state: {message}")
 
 
 # --- Bloque de ejemplo (ya no se usa directamente así) ---

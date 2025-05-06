@@ -16,6 +16,8 @@ from flask_cors import CORS
 # Importar funciones y variables usando importaciones ABSOLUTAS (desde src)
 from src.config_loader import load_config, CONFIG_FILE_PATH
 from src.logger_setup import setup_logging, get_logger
+from run_bot import worker_statuses, status_lock # <-- Importar solo lo necesario de run_bot
+import threading # Necesario para el Lock
 
 # --- Configuración Inicial ---
 # Es importante configurar el logging primero
@@ -174,6 +176,25 @@ def update_config_endpoint():
     except Exception as e:
         logger.error(f"Error al escribir la configuración: {e}", exc_info=True)
         return jsonify({"error": "Failed to write configuration"}), 500
+
+# --- NUEVO Endpoint para Estado de Workers ---
+@app.route('/api/status', methods=['GET'])
+def get_worker_status():
+    """
+    Devuelve el estado actual de todos los workers activos.
+    Lee del diccionario compartido 'worker_statuses'.
+    """
+    logger = get_logger()
+    logger.debug("API call received for /api/status")
+    
+    # Acceder al diccionario compartido de forma segura usando el lock
+    with status_lock:
+        # Crear una copia para evitar problemas si se modifica mientras se envía
+        current_statuses = dict(worker_statuses) 
+    
+    logger.debug(f"Returning statuses for {len(current_statuses)} workers.")
+    return jsonify(current_statuses)
+# -------------------------------------------
 
 # --- Bloque para ejecutar directamente (si se llama con python -m src.api_server) ---
 if __name__ == '__main__':
