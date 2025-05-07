@@ -15,7 +15,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Importar las piezas necesarias desde nuestro paquete 'src'
 try:
-    from src.config_loader import load_config, get_trading_symbols, CONFIG_FILE_PATH
+    from src.config_loader import load_config, CONFIG_FILE_PATH
     from src.logger_setup import setup_logging, get_logger
     # La clase se llama TradingBot, su __init__ no toma args,
     # y tiene un método run_once() síncrono.
@@ -23,6 +23,13 @@ try:
     # --- Importar función de inicialización de DB --- 
     from src.database import init_db_schema
     # ----------------------------------------------
+    from src.api_server import (
+        app as flask_api_app, # Importar 'app' y renombrarla si se prefiere, o usar 'app' directamente
+        load_initial_config, # Nueva función para cargar config en api_server
+        stop_event, 
+        threads,
+        workers_started
+    )
 except ImportError as e:
     import traceback
     traceback.print_exc()
@@ -33,11 +40,10 @@ except ImportError as e:
     sys.exit(1)
 
 # Variable global para indicar a los hilos que deben detenerse
-stop_event = threading.Event()
-threads = [] # Lista para guardar los hilos
-# --- Diccionario y Lock para Estados de Workers ---
-worker_statuses = {} # Ej: {'BTCUSDT': {'state': 'IN_POSITION', 'pnl': 5.2}, 'ETHUSDT': ...}
-status_lock = threading.Lock() # Para proteger el acceso a worker_statuses
+# threads = [] # Lista para guardar los hilos
+# --- Diccionario y Lock para Estados de Workers (AHORA IMPORTADOS DESDE api_server) ---
+# worker_statuses = {} # <-- ELIMINAR
+# status_lock = threading.Lock() # <-- ELIMINAR
 # -------------------------------------------------
 
 def calculate_sleep_from_interval(interval_str: str) -> int:
@@ -89,103 +95,86 @@ def get_sleep_seconds(trading_params: dict) -> int:
         logger.error(f"Error inesperado al obtener tiempo de espera: {e}. Usando 60s por defecto.", exc_info=True)
         return 60
 
-def run_bot_worker(symbol, trading_params, stop_event):
+# --- FUNCIÓN PARA EJECUTAR FLASK EN UN HILO ---
+def run_flask_app():
+    logger_flask = get_logger()
+    logger_flask.info("Iniciando servidor API Flask en un hilo separado...")
+    try:
+        # Deshabilitar el reloader de Flask y el modo debug cuando se ejecuta integrado
+        flask_api_app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
+        logger_flask.info("Servidor Flask detenido.") # Esto se logueará si .run() termina limpiamente
+    except Exception as e:
+        logger_flask.critical(f"Error fatal al intentar ejecutar el servidor Flask en su hilo: {e}", exc_info=True)
+    finally:
+        logger_flask.info("Hilo del servidor Flask finalizando.")
+# --------------------------------------------
+
+def run_bot_worker(symbol, trading_params, stop_event_ref):
     """Función ejecutada por cada hilo para manejar un bot de símbolo único."""
     logger = get_logger()
     
-    # --- Crear la instancia del Bot UNA SOLA VEZ ---
     bot_instance = None
     try:
         bot_instance = TradingBot(symbol=symbol, trading_params=trading_params)
-        # --- Inicializar estado en el diccionario compartido ---
         with status_lock:
              worker_statuses[symbol] = bot_instance.get_current_status() 
-             # Inicialmente podría ser INITIALIZING o ya IN_POSITION si detectó algo
-        # ---------------------------------------------------
         logger.info(f"[{symbol}] Worker thread iniciado. Instancia de TradingBot creada. Tiempo de espera: {get_sleep_seconds(trading_params)}s")
     except (ValueError, ConnectionError) as init_error:
          logger.error(f"No se pudo inicializar la instancia de TradingBot para {symbol}: {init_error}. Terminando worker.", exc_info=True)
-         # --- Actualizar estado a ERROR en el diccionario compartido ---
          with status_lock:
               worker_statuses[symbol] = {
-                  'symbol': symbol,
-                  'state': BotState.ERROR.value, # Usar el valor del Enum
-                  'last_error': str(init_error),
-                  # Añadir otros campos con None o valores por defecto
-                  'in_position': False,
-                  'entry_price': None,
-                  'quantity': None,
-                  'pnl': None,
-                  'pending_entry_order_id': None,
-                  'pending_exit_order_id': None
+                  'symbol': symbol, 'state': BotState.ERROR.value, 'last_error': str(init_error),
+                  'in_position': False, 'entry_price': None, 'quantity': None, 'pnl': None,
+                  'pending_entry_order_id': None, 'pending_exit_order_id': None
               }
-         # ----------------------------------------------------------
-         return # Salir de la función si falla la inicialización
+         return
     except Exception as thread_error:
          logger.error(f"Error inesperado al crear instancia de TradingBot para {symbol}: {thread_error}. Terminando worker.", exc_info=True)
-         # --- Actualizar estado a ERROR en el diccionario compartido ---
          with status_lock:
               worker_statuses[symbol] = {
-                  'symbol': symbol,
-                  'state': BotState.ERROR.value, 
+                  'symbol': symbol, 'state': BotState.ERROR.value, 
                   'last_error': f"Unexpected init error: {thread_error}",
                   'in_position': False, 'entry_price': None, 'quantity': None, 'pnl': None,
                   'pending_entry_order_id': None, 'pending_exit_order_id': None
               }
-         # ----------------------------------------------------------
          return
 
-    # Calcular tiempo de espera
     sleep_duration = get_sleep_seconds(trading_params)
 
-    while not stop_event.is_set():
+    while not stop_event_ref.is_set():
         try:
-            # --- Ejecutar un ciclo del bot ---
-            if bot_instance: # Asegurarse que la instancia fue creada
+            if bot_instance:
                 bot_instance.run_once()
-
-            # --- Actualizar estado en diccionario compartido --- 
             if bot_instance:
                 with status_lock:
                      worker_statuses[symbol] = bot_instance.get_current_status()
-            # --------------------------------------------------
-
         except Exception as cycle_error:
             logger.error(f"[{symbol}] Error inesperado en el ciclo principal del worker: {cycle_error}", exc_info=True)
-            # --- Actualizar estado a ERROR en diccionario compartido --- 
             if bot_instance:
-                # Intentar poner el estado de error del bot si es posible
                 bot_instance._set_error_state(f"Unhandled exception in worker loop: {cycle_error}")
                 with status_lock:
                      worker_statuses[symbol] = bot_instance.get_current_status()
-            else: # Si el error ocurrió antes o sin instancia
+            else:
                  with status_lock:
                       worker_statuses[symbol] = {
-                          'symbol': symbol,
-                          'state': BotState.ERROR.value, 
+                          'symbol': symbol, 'state': BotState.ERROR.value, 
                           'last_error': f"Unhandled exception in worker loop: {cycle_error}",
                           'in_position': False, 'entry_price': None, 'quantity': None, 'pnl': None,
                           'pending_entry_order_id': None, 'pending_exit_order_id': None
                       }
-            # ---------------------------------------------------------
-            # ¿Deberíamos detener el worker aquí o intentar continuar?
-            # Por ahora, continuaremos después de un error, el bot intentará recuperarse.
-            # Podríamos añadir un contador de errores para detener si falla repetidamente.
             pass 
 
-        # Esperar antes del próximo ciclo, pero permitir interrupción
-        # logger.debug(f"[{symbol}] Ciclo completado. Esperando {sleep_duration}s...")
-        interrupted = stop_event.wait(timeout=sleep_duration) # Espera N seg O hasta que set() sea llamado
+        interrupted = stop_event_ref.wait(timeout=sleep_duration)
         if interrupted:
             logger.info(f"[{symbol}] Señal de parada recibida durante la espera.")
-            break # Salir del bucle while
+            break
 
     logger.info(f"[{symbol}] Worker thread terminado.")
-    # --- Opcional: Actualizar estado final a algo como 'STOPPED'? ---
-    # with status_lock:
-    #      if symbol in worker_statuses:
-    #           worker_statuses[symbol]['state'] = 'Stopped' 
-    # ---------------------------------------------------------------
+    with status_lock:
+         if symbol in worker_statuses and isinstance(worker_statuses[symbol], dict):
+              worker_statuses[symbol]['state'] = BotState.STOPPED.value
+         else:
+              worker_statuses[symbol] = {'symbol': symbol, 'state': BotState.STOPPED.value}
 
 def signal_handler(sig, frame):
     """Manejador para señales como SIGINT (Ctrl+C) y SIGTERM."""
@@ -194,126 +183,98 @@ def signal_handler(sig, frame):
     stop_event.set() # Indicar a todos los hilos que se detengan
 
 def main():
-    """Función principal: configura, crea hilos para cada símbolo y los gestiona."""
-    logger = None # Definir logger fuera del try para usarlo en finally
+    """Función principal: configura, inicia API, y espera señal de parada."""
+    logger = None
     try:
-        # 1. Configurar logging (como antes)
-        logger = setup_logging(log_filename='bot.log')
+        # 1. Configuración inicial (Logging, Señales)
+        logger = setup_logging(log_filename='bot_combined.log')
         logger.info("="*40)
-        logger.info("Iniciando el Multi-Symbol Binance RSI Trading Bot...")
+        logger.info("Iniciando el Multi-Symbol Binance RSI Trading Bot & API Server...")
         logger.info("="*40)
 
-        # Registrar manejadores de señal para apagado limpio
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         logger.info("Manejadores de señal registrados (Ctrl+C para detener).")
 
-        # 2. Cargar configuración general
-        logger.info(f"Cargando configuración desde: {CONFIG_FILE_PATH}")
-        config = load_config()
-        if not config:
-            logger.error("No se pudo cargar la configuración. Terminando.")
+        # 2. Cargar Configuración Inicial (ahora lo hace api_server)
+        logger.info("Cargando configuración inicial...")
+        if not load_initial_config(): # Llama a la función importada
+            logger.critical("Fallo al cargar la configuración inicial desde api_server. Terminando.")
             return
+        logger.info("Configuración inicial cargada en el módulo API.")
             
-        # 3. Inicializar el esquema de la base de datos
+        # 3. Inicializar Base de Datos
         logger.info("Inicializando/Verificando esquema de la base de datos SQLite...")
         if not init_db_schema():
             logger.critical("Fallo al inicializar el esquema de la DB. Abortando.")
             return
         logger.info("Esquema de la base de datos OK.")
 
-        # 4. Obtener la lista de símbolos
-        symbols_to_trade = get_trading_symbols()
-        if not symbols_to_trade:
-            logger.error("No se especificaron símbolos para operar en [SYMBOLS]/symbols_to_trade. Terminando.")
-            return
-        logger.info(f"Símbolos a operar: {', '.join(symbols_to_trade)}")
+        # --- 4. INICIAR HILO DEL SERVIDOR API FLASK ---
+        logger.info("Iniciando el servidor API Flask...")
+        # Nota: run_flask_app ahora debe ejecutarse desde dentro de api_server o importarse
+        # Asumiendo que Flask se ejecuta al iniciar el script si api_server.py se importa
+        # O mejor, iniciar explícitamente como antes:
+        api_thread = threading.Thread(target=lambda: flask_api_app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False), 
+                                      name="FlaskAPIServerThread", daemon=True)
+        api_thread.start()
+        logger.info("Hilo del servidor API Flask iniciado.")
+        # -----------------------------------------
 
-        # 5. Extraer parámetros de trading compartidos
-        if 'TRADING' not in config:
-             logger.error("Sección [TRADING] no encontrada en config.ini. Terminando.")
-             return
-        # Convertir la sección a un diccionario
-        trading_params = dict(config['TRADING'])
-        logger.info(f"Parámetros de trading compartidos: {trading_params}")
+        # --- 5. NO iniciar los workers aquí --- 
+        # Los workers ahora se inician bajo demanda desde el endpoint /api/start_bots
+        logger.info("Servidor listo. Los workers se iniciarán desde la API (/api/start_bots).")
         
-        # 6. Calcular tiempo de espera (usando los parámetros extraídos)
-        sleep_seconds = get_sleep_seconds(trading_params)
-        logger.info(f"Tiempo de espera base entre ciclos para cada worker: {sleep_seconds} segundos.")
+        # --- 6. Esperar señal de parada --- 
+        # El hilo principal ahora solo necesita esperar a que se active stop_event
+        logger.info("Proceso principal esperando señal de apagado (Ctrl+C o /api/shutdown)...")
+        stop_event.wait() # Espera aquí hasta que stop_event.set() sea llamado
+        logger.info("Señal de apagado detectada en el hilo principal.")
 
-        # 7. Crear e iniciar un hilo para cada símbolo
-        logger.info("Creando e iniciando workers para cada símbolo...")
-        for symbol in symbols_to_trade:
-            logger.info(f"-> Preparando worker para {symbol}...")
-            # La creación de la instancia de TradingBot ahora está DENTRO de run_bot_worker
-            # Solo creamos e iniciamos el hilo aquí.
-            thread = threading.Thread(target=run_bot_worker, args=(symbol, trading_params, stop_event), name=f"Worker-{symbol}")
-            thread.daemon = True # Marcar como daemon para que no impidan salir si el principal termina
-            threads.append(thread) # Guardar el hilo en la lista
-            thread.start() # Iniciar el hilo
-            # No hay log de "iniciado" aquí, se hace dentro del worker si tiene éxito
-            time.sleep(0.5) # Pequeña pausa para evitar rate limits al iniciar muchos workers
-
-        # 8. Mantener el hilo principal vivo y esperar la señal de parada
-        logger.info(f"Todos los workers iniciados ({len(threads)} activos). El proceso principal esperará la señal de parada.")
-        while not stop_event.is_set():
-            # Esperar indefinidamente hasta que stop_event se active por la señal
-            # Usamos un timeout largo para poder comprobar periódicamente
-            stopped = stop_event.wait(timeout=60) 
-            if stopped:
-                logger.info("Proceso principal detectó señal de parada.")
-                break
-            # Opcional: Podríamos añadir aquí lógica para verificar salud de los hilos, etc.
-            # logger.debug(f"[{time.strftime('%H:%M:%S')}] Proceso principal esperando...")
+        # 7. Esperar (brevemente) a que los hilos terminen (Flask y workers si están activos)
+        # El endpoint /api/shutdown ya hace join en los workers.
+        # Solo necesitamos esperar al hilo de Flask.
+        logger.info("Esperando finalización del hilo de la API...")
+        # Flask no termina limpiamente solo con daemon=True, necesita una señal externa o una ruta de apagado.
+        # El stop_event no detiene Flask directamente. Podríamos añadir una llamada a /api/shutdown aquí si no se hizo?
+        # Por ahora, confiamos en que signal_handler o /api/shutdown llamaron a stop_event.set()
+        api_thread.join(timeout=5) # Espera brevemente al hilo de Flask
+        if api_thread.is_alive():
+             logger.warning("El hilo del servidor API Flask no terminó limpiamente.")
 
     except KeyboardInterrupt:
-        # Esto no debería ocurrir si el signal handler funciona, pero por si acaso
-        if logger: logger.warning("KeyboardInterrupt en el hilo principal (inesperado). Iniciando apagado...")
-        stop_event.set()
+        logger.warning("KeyboardInterrupt recibido en el hilo principal (main).")
+        if stop_event and not stop_event.is_set():
+             stop_event.set() # Asegurar que el evento se activa
     except Exception as e:
         if logger:
-            logger.critical(f"Error fatal inesperado en el proceso principal: {e}", exc_info=True)
+            logger.critical(f"Error crítico en la función main: {e}", exc_info=True)
         else:
-            print(f"Error fatal inesperado: {e}", file=sys.stderr)
-            import traceback
+            print(f"Error crítico en la función main (logger no disponible): {e}", file=sys.stderr)
             traceback.print_exc()
-        stop_event.set() # Intentar detener hilos si hay error fatal
-        
     finally:
-        # --- Limpieza Final --- 
+        # --- Secuencia de apagado final --- 
         if logger:
-             logger.warning("Iniciando secuencia de apagado. Esperando a que terminen los workers...")
-        else:
-             print("Iniciando secuencia de apagado...")
-             
-        # Esperar a que todos los hilos terminen (con un timeout)
-        for thread in threads:
-            if thread.is_alive():
-                logger.info(f"Esperando al worker {thread.name}...")
-                thread.join(timeout=10) # Dar 10 segundos para terminar limpiamente
-                if thread.is_alive():
-                     logger.warning(f"¡El worker {thread.name} no terminó a tiempo!")
+            logger.info("Iniciando secuencia de apagado final en main()...")
+            
+            # Asegurarse de que el evento de parada esté activo
+            if stop_event and not stop_event.is_set():
+                logger.info("Activando stop_event durante el apagado final.")
+                stop_event.set()
+                
+            logger.info("Asegurándose de que todos los hilos de bot hayan terminado...")
+            # El endpoint /api/shutdown ya hizo join, pero podemos verificar
+            active_bot_threads = [t.name for t in threads if t.is_alive()]
+            if active_bot_threads:
+                 logger.warning(f"Los siguientes hilos de bot seguían activos: {active_bot_threads}")
             else:
-                logger.info(f"Worker {thread.name} ya había terminado.")
+                 logger.info("Confirmado: No hay hilos de bot activos.")
 
-        # Cerrar pool de DB (si se inicializó globalmente)
-        # from src.database import close_db_pool
-        # logger.info("Cerrando pool de DB...")
-        # close_db_pool()
-        # logger.info("Pool de DB cerrado.")
-
-        if logger:
             logger.info("="*40)
-            logger.info("El Bot Multi-Símbolo ha terminado.")
+            logger.info("Bot y API Server apagados.")
             logger.info("="*40)
         else:
-            print("El Bot Multi-Símbolo ha terminado.")
+            print("\nApagado finalizado (logger no disponible).")
 
-if __name__ == "__main__":
-    # La inicialización de DB/Schema debería hacerse aquí antes de crear los bots
-    # import src.database
-    # if not src.database.init_db_pool() or not src.database.init_db_schema():
-    #     print("CRITICAL: Falla al inicializar la base de datos. Saliendo.", file=sys.stderr)
-    #     sys.exit(1)
-        
-    main() # Llamar a la función principal refactorizada 
+if __name__ == '__main__':
+    main() 

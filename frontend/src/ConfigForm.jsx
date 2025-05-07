@@ -13,8 +13,8 @@ const initialConfig = {
   volumeSmaPeriod: 20,
   volumeFactor: 1.5,
   positionSizeUSDT: 50,
-  stopLossUSDT: -0.3,
-  takeProfitUSDT: 0,
+  stopLossUSDT: 20,
+  takeProfitUSDT: 30,
   cycleSleepSeconds: 0,
   mode: 'paper',
   active: false,
@@ -24,14 +24,13 @@ const initialConfig = {
 // Helper function to parse potential numbers from config
 const parseValue = (value, defaultValue, name = '') => {
   if (value === '' || value === null || value === undefined) return defaultValue;
-  if (value === '-') {
-    return name === 'stopLossUSDT' ? value : defaultValue;
+  // Allow '-' as a valid starting character for relevant fields
+  if ((name === 'stopLossUSDT' || name === 'rsiThresholdDown') && value === '-') {
+      return '-'; // Keep it as a string for now, will be parsed later or on blur
   }
   const num = Number(value);
+
   if (!isNaN(num)) {
-    if (name === 'stopLossUSDT' && num > 0) {
-      console.warn("Stop Loss debe ser negativo o cero.");
-    }
     if (name === 'takeProfitUSDT' && num < 0) {
       console.warn("Take Profit debe ser positivo o cero.");
     }
@@ -78,17 +77,17 @@ function ConfigForm() {
           mode: backendConfig.BINANCE?.mode || 'paper',
           symbolsToTrade: backendConfig.SYMBOLS?.symbols_to_trade || '',
           rsiInterval: backendConfig.TRADING?.rsi_interval || '5m',
-          rsiPeriod: parseValue(backendConfig.TRADING?.rsi_period, 14, 'rsiPeriod'),
-          rsiThresholdUp: parseValue(backendConfig.TRADING?.rsi_threshold_up, 8, 'rsiThresholdUp'),
-          rsiThresholdDown: parseValue(backendConfig.TRADING?.rsi_threshold_down, -8, 'rsiThresholdDown'),
-          rsiEntryLevelLow: parseValue(backendConfig.TRADING?.rsi_entry_level_low, 25, 'rsiEntryLevelLow'),
-          volumeSmaPeriod: parseValue(backendConfig.TRADING?.volume_sma_period, 20, 'volumeSmaPeriod'),
-          volumeFactor: parseValue(backendConfig.TRADING?.volume_factor, 1.5, 'volumeFactor'),
-          positionSizeUSDT: parseValue(backendConfig.TRADING?.position_size_usdt, 50, 'positionSizeUSDT'),
-          stopLossUSDT: parseValue(backendConfig.TRADING?.stop_loss_usdt, -0.3, 'stopLossUSDT'),
-          takeProfitUSDT: parseValue(backendConfig.TRADING?.take_profit_usdt, 0, 'takeProfitUSDT'),
-          cycleSleepSeconds: parseValue(backendConfig.TRADING?.cycle_sleep_seconds, 0, 'cycleSleepSeconds'),
-          orderTimeoutSeconds: parseValue(backendConfig.TRADING?.order_timeout_seconds, 60, 'orderTimeoutSeconds'),
+          rsiPeriod: parseValue(backendConfig.TRADING?.rsi_period, initialConfig.rsiPeriod, 'rsiPeriod'),
+          rsiThresholdUp: parseValue(backendConfig.TRADING?.rsi_threshold_up, initialConfig.rsiThresholdUp, 'rsiThresholdUp'),
+          rsiThresholdDown: parseValue(backendConfig.TRADING?.rsi_threshold_down, initialConfig.rsiThresholdDown, 'rsiThresholdDown'),
+          rsiEntryLevelLow: parseValue(backendConfig.TRADING?.rsi_entry_level_low, initialConfig.rsiEntryLevelLow, 'rsiEntryLevelLow'),
+          volumeSmaPeriod: parseValue(backendConfig.TRADING?.volume_sma_period, initialConfig.volumeSmaPeriod, 'volumeSmaPeriod'),
+          volumeFactor: parseValue(backendConfig.TRADING?.volume_factor, initialConfig.volumeFactor, 'volumeFactor'),
+          positionSizeUSDT: parseValue(backendConfig.TRADING?.position_size_usdt, initialConfig.positionSizeUSDT, 'positionSizeUSDT'),
+          stopLossUSDT: parseValue(backendConfig.TRADING?.stop_loss_usdt, initialConfig.stopLossUSDT, 'stopLossUSDT'),
+          takeProfitUSDT: parseValue(backendConfig.TRADING?.take_profit_usdt, initialConfig.takeProfitUSDT, 'takeProfitUSDT'),
+          cycleSleepSeconds: parseValue(backendConfig.TRADING?.cycle_sleep_seconds, initialConfig.cycleSleepSeconds, 'cycleSleepSeconds'),
+          orderTimeoutSeconds: parseValue(backendConfig.TRADING?.order_timeout_seconds, initialConfig.orderTimeoutSeconds, 'orderTimeoutSeconds'),
           active: config.active,
         };
 
@@ -114,23 +113,42 @@ function ConfigForm() {
 
     let processedValue = value;
 
+    const numericTextFields = [
+      'rsiThresholdUp', 'rsiThresholdDown', 'rsiEntryLevelLow', 'volumeFactor',
+      'positionSizeUSDT', 'stopLossUSDT', 'takeProfitUSDT'
+    ];
+    const integerNumberFields = [
+      'rsiPeriod', 'volumeSmaPeriod', 'cycleSleepSeconds', 'orderTimeoutSeconds'
+    ];
+
     if (type === 'checkbox') {
       processedValue = checked;
-    } else if (name === 'symbolsToTrade') {
-      processedValue = value;
-    } else if (type === 'number' || [
-      'rsiPeriod', 'rsiThresholdUp', 'rsiThresholdDown', 'rsiEntryLevelLow',
-      'volumeSmaPeriod', 'volumeFactor',
-      'positionSizeUSDT', 'takeProfitUSDT', 'stopLossUSDT', 'cycleSleepSeconds', 'orderTimeoutSeconds'
-    ].includes(name)) {
-      if (value === '' || (value === '-' && name === 'stopLossUSDT')) {
+    } else if (numericTextFields.includes(name)) {
+      const isValidNumericString = (val) => {
+        if (val === '') return true;
+        // Allow just a minus sign for fields that can be negative
+        if ((name === 'rsiThresholdDown' || name === 'stopLossUSDT') && val === '-') return true;
+        // Regex to allow optional leading minus, digits, optional single decimal point, and more digits
+        return /^-?\d*\.?\d*$/.test(val) && (val.match(/\./g) || []).length <= 1 && (val.match(/-/g) || []).length <= (val.startsWith('-') ? 1: 0) ;
+      };
+
+      if (isValidNumericString(value)) {
+        // Removed the specific block preventing '-' for stopLossUSDT
         processedValue = value;
       } else {
-        const num = Number(value);
-        processedValue = isNaN(num) ? config[name] : num;
+        // If not valid, revert to the current value in state for that field
+        processedValue = config[name]; 
       }
-    } else {
-      processedValue = value;
+    } else if (integerNumberFields.includes(name)) {
+      if (value === '') {
+        processedValue = ''; 
+      } else {
+        const num = Number(value);
+        processedValue = Number.isInteger(num) ? num : config[name]; 
+        if (name === 'cycleSleepSeconds' && num !== 0 && num < 5 && value !== '') {
+             processedValue = num;
+        }
+      }
     }
 
     setConfig(prevConfig => ({
@@ -138,7 +156,6 @@ function ConfigForm() {
       [name]: processedValue,
     }));
   };
-
 
   // --- Manejador para enviar el formulario a la API ---
   const handleSubmit = async (e) => {
@@ -150,7 +167,7 @@ function ConfigForm() {
     const symbolsList = symbolsRaw.split(',').map(s => s.trim().toUpperCase()).filter(s => s);
     const cleanSymbolsString = symbolsList.join(',');
 
-    // Crear el objeto a enviar, asegurando tipos correctos
+    // Crear el objeto a enviar, asegurando tipos correctos usando parseValue
     const configToSend = {
       apiKey: config.apiKey,
       apiSecret: config.apiSecret,
@@ -170,8 +187,13 @@ function ConfigForm() {
       orderTimeoutSeconds: parseValue(config.orderTimeoutSeconds, initialConfig.orderTimeoutSeconds, 'orderTimeoutSeconds'),
     };
     
-    // Actualizar el estado local con los valores limpios (opcional, pero bueno para UI)
-    setConfig(prev => ({ ...prev, ...configToSend, active: prev.active }));
+    // Actualizar el estado local con los valores limpios/parseados (bueno para UI consistency)
+    setConfig(prev => ({ 
+        ...prev,
+        ...configToSend,
+        symbolsToTrade: cleanSymbolsString,
+        active: prev.active
+    }));
 
     try {
       const response = await fetch('http://localhost:5001/api/config', {
@@ -293,14 +315,9 @@ function ConfigForm() {
                   className={selectClass}
                   required
                 >
-                  <option value="1m">1 minuto</option>
-                  <option value="3m">3 minutos</option>
-                  <option value="5m">5 minutos</option>
-                  <option value="15m">15 minutos</option>
-                  <option value="30m">30 minutos</option>
-                  <option value="1h">1 hora</option>
-                  <option value="2h">2 horas</option>
-                  <option value="4h">4 horas</option>
+                  {['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d'].map(interval => (
+                    <option key={interval} value={interval}>{interval}</option>
+                  ))}
                 </select>
               </div>
             </div>
@@ -333,15 +350,14 @@ function ConfigForm() {
                   RSI Subida <span className="text-red-500">*</span>
                 </label>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="decimal"
                   name="rsiThresholdUp"
                   id="rsiThresholdUp"
                   value={config.rsiThresholdUp}
                   onChange={handleChange}
-                  className={inputNumberClass}
+                  className={inputClass}
                   required
-                  step="any"
-                  placeholder="Ej: 8"
                 />
                  <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Cambio positivo de RSI para entrar.</p>
               </div>
@@ -350,15 +366,14 @@ function ConfigForm() {
                   RSI Bajada <span className="text-red-500">*</span>
                 </label>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="decimal"
                   name="rsiThresholdDown"
                   id="rsiThresholdDown"
                   value={config.rsiThresholdDown}
                   onChange={handleChange}
-                  className={inputNumberClass}
+                  className={inputClass}
                   required
-                  step="any"
-                  placeholder="Ej: -8"
                 />
                  <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Cambio negativo de RSI para salir.</p>
               </div>
@@ -367,12 +382,13 @@ function ConfigForm() {
                   RSI Entry
                 </label>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="decimal"
                   name="rsiEntryLevelLow"
                   id="rsiEntryLevelLow"
                   value={config.rsiEntryLevelLow}
                   onChange={handleChange}
-                  className={inputNumberClass}
+                  className={inputClass}
                   step="0.1"
                   placeholder="e.g., 25"
                 />
@@ -400,12 +416,13 @@ function ConfigForm() {
                   Factor Volumen
                 </label>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="decimal"
                   name="volumeFactor"
                   id="volumeFactor"
                   value={config.volumeFactor}
                   onChange={handleChange}
-                  className={inputNumberClass}
+                  className={inputClass}
                   min="0.01"
                   step="0.01"
                   placeholder="Ej: 1.5"
@@ -424,12 +441,13 @@ function ConfigForm() {
                   Tamaño Posición (USDT) <span className="text-red-500">*</span>
                 </label>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="decimal"
                   name="positionSizeUSDT"
                   id="positionSizeUSDT"
                   value={config.positionSizeUSDT}
                   onChange={handleChange}
-                  className={inputNumberClass}
+                  className={inputClass}
                   required
                   min="1"
                   step="any"
@@ -443,12 +461,13 @@ function ConfigForm() {
                 </label>
                 <input
                   type="text"
+                  inputMode="decimal"
                   name="stopLossUSDT"
                   id="stopLossUSDT"
                   value={config.stopLossUSDT}
                   onChange={handleChange}
                   className={inputClass}
-                  placeholder="Ej: -0.3 (o 0)"
+                  placeholder="Ej: 20 (o 0)"
                 />
                  <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Pérdida máx. (negativo o 0). 0 o vacío = deshabilitado.</p>
               </div>
@@ -457,15 +476,16 @@ function ConfigForm() {
                   Take Profit (USDT)
                 </label>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="decimal"
                   name="takeProfitUSDT"
                   id="takeProfitUSDT"
                   value={config.takeProfitUSDT}
                   onChange={handleChange}
-                  className={inputNumberClass}
+                  className={inputClass}
                   min="0"
                   step="any"
-                  placeholder="Ej: 5 (o 0)"
+                  placeholder="Ej: 30 (o 0)"
                 />
                  <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Ganancia a la que cerrar (positivo o 0). 0 o vacío = deshabilitado.</p>
               </div>

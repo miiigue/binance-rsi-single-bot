@@ -5,84 +5,80 @@ import './index.css'; // Importar el archivo CSS principal existente
 
 function App() {
   const [config, setConfig] = useState(null); // Estado para la configuración
-  // const [theme, setTheme] = useState(localStorage.getItem('theme') || 'light'); // REMOVED theme state
+  const [botsRunning, setBotsRunning] = useState(null); // null: desconocido, true: corriendo, false: detenidos
+  const [initialLoadingError, setInitialLoadingError] = useState(null); // Para errores de carga inicial
 
-  // useEffect para cargar la configuración inicial desde la API
+  // Efecto para la carga inicial de configuración y estado
   useEffect(() => {
-    const apiUrl = '/api/config'; // La URL del endpoint GET de tu API Flask
+    const fetchInitialData = async () => {
+        setInitialLoadingError(null); // Resetear error
+        try {
+            // Intentar obtener la configuración primero
+            const configResponse = await fetch('/api/config');
+            if (!configResponse.ok) {
+                throw new Error(`Error al cargar configuración: ${configResponse.status}`);
+            }
+            const configData = await configResponse.json();
+            // Aplanar configuración como antes...
+            const symbolsString = configData.SYMBOLS?.symbols_to_trade || ''; 
+            const flatConfig = {
+                 apiKey: configData.BINANCE?.api_key || '',
+                 apiSecret: configData.BINANCE?.api_secret || '',
+                 mode: configData.BINANCE?.mode || 'paper',
+                 rsiInterval: configData.TRADING?.rsi_interval || '1m',
+                 rsiPeriod: configData.TRADING?.rsi_period || 14,
+                 rsiThresholdUp: configData.TRADING?.rsi_threshold_up || 1.5,
+                 rsiThresholdDown: configData.TRADING?.rsi_threshold_down || -1.0,
+                 rsiEntryLevelLow: configData.TRADING?.rsi_entry_level_low || 30,
+                 positionSizeUSDT: configData.TRADING?.position_size_usdt || 50,
+                 stopLossUSDT: configData.TRADING?.stop_loss_usdt || 0,
+                 takeProfitUSDT: configData.TRADING?.take_profit_usdt || 0,
+                 cycleSleepSeconds: configData.TRADING?.cycle_sleep_seconds || 60,
+                 volumeSmaPeriod: configData.TRADING?.volume_sma_period || 20,
+                 volumeFactor: configData.TRADING?.volume_factor || 1.5,
+                 orderTimeoutSeconds: configData.TRADING?.order_timeout_seconds || 60,
+                 symbolsToTrade: symbolsString 
+            };
+            setConfig(flatConfig);
+            console.log("Configuración inicial cargada.", flatConfig);
 
-    console.log("App component mounted - Fetching initial config from", apiUrl);
-
-    fetch(apiUrl)
-      .then(response => {
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+            // Ahora, obtener el estado general (que incluye si los bots están corriendo)
+            const statusResponse = await fetch('/api/status');
+            if (!statusResponse.ok) {
+                 // Si la config cargó pero el estado falla, aún podemos mostrar config
+                 console.warn("Configuración cargada, pero falló la carga inicial del estado de los bots.");
+                 setBotsRunning(false); // Asumir que no corren si el estado falla
+                 // No lanzar error aquí para permitir que ConfigForm se muestre
+            } else {
+                const statusData = await statusResponse.json();
+                setBotsRunning(statusData.bots_running); // Establecer estado basado en la respuesta
+                console.log("Estado inicial de bots cargado. Corriendo:", statusData.bots_running);
+            }
+            
+        } catch (error) {
+            console.error("Error crítico durante la carga inicial:", error);
+            setInitialLoadingError(`Error al cargar datos iniciales: ${error.message}. Intenta recargar o revisa el servidor.`);
+            setConfig(null); // No mostrar config si hay error crítico
+            setBotsRunning(false); // Asumir que no corren
         }
-        return response.json();
-      })
-      .then(data => {
-        console.log("Config received from API:", data);
-        // Aquí asumimos que la API devuelve un objeto con secciones 
-        // como 'BINANCE', 'TRADING', 'SYMBOLS'.
-        // El componente ConfigForm probablemente espere una estructura plana.
-        // Vamos a aplanar la estructura necesaria para ConfigForm.
-        
-        // Extraer símbolos
-        const symbolsString = data.SYMBOLS?.symbols_to_trade || ''; 
-        
-        // Combinar parámetros de BINANCE y TRADING (y otros si existieran)
-        // Mapeando a las claves que espera ConfigForm (ej: apiKey, rsiInterval...)
-        // Usaremos un mapeo inverso o crearemos el objeto plano directamente
-        const flatConfig = {
-            apiKey: data.BINANCE?.api_key || '',
-            apiSecret: data.BINANCE?.api_secret || '', // Ten cuidado al exponer secretos
-            mode: data.BINANCE?.mode || 'paper',
-            rsiInterval: data.TRADING?.rsi_interval || '1m',
-            rsiPeriod: data.TRADING?.rsi_period || 14,
-            rsiThresholdUp: data.TRADING?.rsi_threshold_up || 1.5,
-            rsiThresholdDown: data.TRADING?.rsi_threshold_down || -1.0,
-            rsiEntryLevelLow: data.TRADING?.rsi_entry_level_low || 30,
-            positionSizeUSDT: data.TRADING?.position_size_usdt || 50,
-            stopLossUSDT: data.TRADING?.stop_loss_usdt || 0,
-            takeProfitUSDT: data.TRADING?.take_profit_usdt || 0,
-            cycleSleepSeconds: data.TRADING?.cycle_sleep_seconds || 60,
-            volumeSmaPeriod: data.TRADING?.volume_sma_period || 20,
-            volumeFactor: data.TRADING?.volume_factor || 1.5,
-            orderTimeoutSeconds: data.TRADING?.order_timeout_seconds || 60,
-            // Añadir la clave para los símbolos
-            symbolsToTrade: symbolsString 
-        };
-        
-        console.log("Flattened config for state:", flatConfig);
-        setConfig(flatConfig); // Guarda la configuración APLANADA en el estado
-      })
-      .catch(error => {
-        console.error("Error fetching initial configuration:", error);
-        // Podrías poner una configuración por defecto o mostrar un error
-        // setConfig({ ...defaultConfig, error: "Failed to load config" });
-      });
+    };
 
-  }, []); // Array vacío para ejecutar solo al montar
+    fetchInitialData();
+}, []);
 
-  // REMOVED useEffect for theme handling
-
-  // REMOVED toggleTheme function placeholder
-
-  // Function to handle saving config
   const handleSave = (newConfig) => {
-    const apiUrl = '/api/config'; // La URL del endpoint POST
     console.log('Sending updated config to API:', newConfig);
 
-    fetch(apiUrl, {
+    // Devolver una promesa para que se pueda esperar si es necesario
+    return fetch('/api/config', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(newConfig), // Enviar el objeto plano directamente
+      body: JSON.stringify(newConfig),
     })
     .then(response => {
         if (!response.ok) {
-          // Si hay error, intentar leer el mensaje de error del JSON de la API
           return response.json().then(errData => {
               throw new Error(errData.error || `HTTP error! status: ${response.status}`);
           });
@@ -91,43 +87,95 @@ function App() {
     })
     .then(data => {
         console.log('API response after save:', data);
-        // Opcional: Mostrar mensaje de éxito al usuario
-        alert(data.message || 'Configuration saved!');
-        // Opcional: Actualizar el estado local si es necesario (aunque recargar puede ser más simple)
-        // setConfig(newConfig); 
+        alert(data.message || 'Configuration saved! Podría requerir reiniciar los bots para aplicar todos los cambios.');
+        // Recargar la config después de guardar para asegurar consistencia?
+        // Podría ser buena idea, o simplemente informar al usuario.
+        // fetchInitialData(); // Opcional: Recargar todo
+        return true; // Indicar éxito
     })
     .catch(error => {
         console.error('Error saving configuration:', error);
-        // Mostrar mensaje de error al usuario
         alert(`Error saving configuration: ${error.message}`);
+        return false; // Indicar fallo
     });
   };
   
+  // --- Funciones para INICIAR y DETENER bots --- 
+  const handleStartBots = async () => {
+    try {
+      const response = await fetch('/api/start_bots', { method: 'POST' });
+      const data = await response.json(); // Intentar leer JSON siempre
+      if (!response.ok) {
+        throw new Error(data.error || `Error HTTP ${response.status}`);
+      }
+      console.log("Start bots response:", data);
+      setBotsRunning(true); // Actualizar estado local
+      return true; // Éxito
+    } catch (error) {
+      console.error('Error starting bots:', error);
+      // El mensaje de error se maneja en BotControls
+      setBotsRunning(false); // Asegurarse de que el estado refleje el fallo
+      return false; // Fallo
+    }
+  };
+
+  const handleShutdown = async () => {
+    try {
+      const response = await fetch('/api/shutdown', { method: 'POST' });
+      const data = await response.json(); // Intentar leer JSON siempre
+       if (!response.ok) {
+        // Incluso si falla, asumimos que el intento de apagar significa que ya no corren
+        console.warn("Respuesta no OK de shutdown, pero actualizando UI a no corriendo.");
+        // throw new Error(data.message || `Error HTTP ${response.status}`); // Opcional: lanzar error
+      }
+      console.log('Shutdown API response:', data);
+      setBotsRunning(false); // Actualizar estado local
+      return true; // Considerar éxito para la UI incluso si hubo error leve
+    } catch (error) {
+      console.error('Error sending shutdown signal:', error);
+      // El mensaje de error se maneja en BotControls
+       setBotsRunning(false); // Asegurarse de que el estado refleje el fallo
+      return false; // Fallo
+    }
+  };
+  // ------------------------------------------
+
   return (
-    // REMOVED dynamic theme classes from root div
-    <div className="min-h-screen"> 
-      {/* Applied base background and text colors directly */}
-      <div className="bg-gray-100 text-gray-900 p-4 md:p-8">
-        <div className="max-w-4xl mx-auto">
-          {/* REMOVED flex justify-between from header as button is gone */}
-          <header className="items-center mb-8">
-            {/* Centered the title slightly for balance */}
-            <h1 className="text-3xl font-bold text-blue-600 text-center">Trading Bot Dashboard</h1>
-            {/* REMOVED Theme toggle button */}
-          </header>
+    <div className="min-h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+      <div className="container mx-auto p-4 md:p-8 max-w-5xl">
+        <header className="mb-8">
+          <h1 className="text-3xl font-bold text-blue-600 dark:text-blue-400 text-center">Trading Bot Dashboard</h1>
+        </header>
 
-          {/* -- Sección de Configuración -- */}
-          {config ? (
-            <ConfigForm initialConfig={config} onSave={handleSave} />
-          ) : (
-            <p className="text-center">(Loading configuration...)</p>
-          )}
+        {/* Mostrar error de carga inicial si existe */} 
+        {initialLoadingError && (
+          <div className="mb-6 p-4 bg-red-100 dark:bg-red-900 border border-red-400 dark:border-red-700 text-red-700 dark:text-red-200 rounded-lg">
+             <p className="font-semibold text-center">Error de Carga</p>
+             <p className="text-center">{initialLoadingError}</p>
+           </div>
+        )}
 
-          {/* -- NUEVA Sección de Estado -- */}
-          <StatusDisplay /> 
-          {/* -------------------------- */}
+        {/* Solo mostrar controles y status si no hubo error crítico inicial */} 
+        {!initialLoadingError && (
+          <>
+             {/* La sección BotControls fue movida a StatusDisplay */}
+             {/* Asegurarse que no queden restos aquí */}
 
-        </div> 
+            {/* -- Sección de Configuración -- */}
+            {config ? (
+                <ConfigForm initialConfig={config} onSave={handleSave} />
+            ) : (
+                <p className="text-center">(Loading configuration...)</p>
+            )}
+
+            {/* -- Sección de Estado (sin cambios, ya pasa props) -- */}
+            <StatusDisplay 
+                botsRunning={botsRunning} 
+                onStart={handleStartBots} 
+                onShutdown={handleShutdown} 
+            /> 
+          </>
+        )}
       </div>
     </div>
   );

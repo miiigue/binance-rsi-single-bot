@@ -36,6 +36,7 @@ class BotState(Enum):
     WAITING_EXIT_FILL = "Waiting Exit Order Fill"
     CANCELING_ORDER = "Canceling Order"
     ERROR = "Error State"
+    STOPPED = "Stopped" # <-- Nuevo estado
 # ------------------------------------
 
 class TradingBot:
@@ -58,6 +59,8 @@ class TradingBot:
         # --- Estado Interno ---
         self.current_state = BotState.INITIALIZING # Estado inicial
         self.last_error_message = None # Para guardar el último error
+        self.last_known_pnl = None # <-- Initialize PnL attribute
+        self.current_exit_reason = None # <-- Razón de la salida pendiente actual
         # ---------------------
 
         # Cliente Binance (se inicializa una vez por bot)
@@ -97,9 +100,6 @@ class TradingBot:
             if self.volume_factor <= 0:
                  self.logger.warning(f"[{self.symbol}] VOLUME_FACTOR ({self.volume_factor}) debe ser positivo. Usando 1.5.")
                  self.volume_factor = 1.5
-            if self.stop_loss_usdt > 0:
-                 self.logger.warning(f"[{self.symbol}] STOP_LOSS_USDT ({self.stop_loss_usdt}) debe ser negativo o cero. Usando 0.")
-                 self.stop_loss_usdt = Decimal('0')
             if self.take_profit_usdt < 0:
                  self.logger.warning(f"[{self.symbol}] TAKE_PROFIT_USDT ({self.take_profit_usdt}) debe ser positivo o cero. Usando 0.")
                  self.take_profit_usdt = Decimal('0')
@@ -134,9 +134,10 @@ class TradingBot:
         self.pending_entry_order_id = None  # Guarda el ID de la orden LIMIT BUY pendiente
         self.pending_exit_order_id = None   # Guarda el ID de la orden LIMIT SELL pendiente
         self.pending_order_timestamp = None # Guarda el time.time() cuando se creó la orden pendiente
+        # self.current_exit_reason = None # Movido arriba con otros estados internos
         # --------------------------------------------------
         
-        self.last_known_pnl = None # <-- Initialize PnL attribute
+        # self.last_known_pnl = None # Ya inicializado arriba
         
         self._check_initial_position() # Llama a get_futures_position con self.symbol
 
@@ -198,6 +199,7 @@ class TradingBot:
              self.pending_entry_order_id = None
              self.pending_exit_order_id = None
              self.pending_order_timestamp = None
+             self.current_exit_reason = None # <-- Resetear razón de salida
 
     def _adjust_quantity(self, quantity: Decimal) -> float:
         """Ajusta la cantidad a la precisión requerida por self.symbol."""
@@ -468,47 +470,83 @@ class TradingBot:
             self._update_state(BotState.FETCHING_DATA) # Estado: obteniendo datos
             # 2.1 Obtener posición actual (podríamos obtenerla antes o aquí)
             position_info = get_futures_position(self.symbol)
+            current_market_price = None # Initialize
+
             if position_info:
                  current_pos_qty = Decimal(position_info.get('positionAmt', '0'))
                  entry_price = Decimal(position_info.get('entryPrice', '0'))
                  unrealized_pnl = Decimal(position_info.get('unRealizedProfit', '0'))
-                 # Actualizar estado interno si la cantidad es > 0
-                 if current_pos_qty > 0:
+                 current_market_price = Decimal(position_info.get('markPrice', '0')) # Get current mark price for exits
+
+                 if abs(current_pos_qty) > Decimal('1e-9'): # Check if effectively in a position
                      # Initialize current_position as dict if bot thinks it's not in position or if it's None
                      if not self.in_position or self.current_position is None: 
                          self.logger.warning(f"[{self.symbol}] Detectada posición externa o recuperada: Qty={current_pos_qty}, Entry={entry_price:.{self.qty_precision}f}")
-                         self.current_position = {} # Initialize as an empty dictionary
+                         self.current_position = {} 
                          
                      self.in_position = True
-                     # Now it's safe to assign keys
                      self.current_position['quantity'] = current_pos_qty
                      self.current_position['entry_price'] = entry_price
-                     # Add entry_time if it's missing after recovery (might need adjustment)
-                     if 'entry_time' not in self.current_position:
-                         self.current_position['entry_time'] = pd.Timestamp.now(tz='UTC') # Placeholder time
-                     self.last_known_pnl = unrealized_pnl
+                     if 'entry_time' not in self.current_position: # Add if missing
+                         self.current_position['entry_time'] = pd.Timestamp.now(tz='UTC') 
+                     self.last_known_pnl = unrealized_pnl # Update PnL
+                     
+                     # --- Verificación de SALIDA por PnL (Stop Loss / Take Profit) --- START ---
+                     if self.in_position and not self.pending_exit_order_id: # Only if in position and no exit pending
+                        # 1. Stop Loss por PnL
+                        sl_pnl_target = self.stop_loss_usdt
+                        if sl_pnl_target < Decimal('0'): # Solo si SL es negativo (activo)
+                            if self.last_known_pnl is not None and self.last_known_pnl <= sl_pnl_target:
+                                self.logger.warning(f"[{self.symbol}] ¡STOP LOSS por PnL alcanzado! PnL Actual: {self.last_known_pnl:.4f} <= Target: {sl_pnl_target:.4f} USDT. Intentando cerrar posición.")
+                                # Usar el precio de mercado actual para la orden de salida
+                                exit_price_sl = self._get_best_exit_price('SELL') 
+                                if exit_price_sl:
+                                    self._place_exit_order(price=exit_price_sl, reason="stop_loss_pnl_hit")
+                                    return # Terminar ciclo, orden de salida colocada
+                                else:
+                                    self.logger.error(f"[{self.symbol}] No se pudo obtener precio para colocar orden de Stop Loss por PnL.")
+                                    # Considerar qué hacer aquí, ¿reintentar? ¿Error?
+
+                        # 2. Take Profit por PnL (solo si no se activó el SL)
+                        if not self.pending_exit_order_id: # Re-check if SL placed an order
+                            tp_pnl_target = self.take_profit_usdt
+                            if tp_pnl_target > Decimal('0'): # Solo si TP es positivo (activo)
+                                if self.last_known_pnl is not None and self.last_known_pnl >= tp_pnl_target:
+                                    self.logger.info(f"[{self.symbol}] ¡TAKE PROFIT por PnL alcanzado! PnL Actual: {self.last_known_pnl:.4f} >= Target: {tp_pnl_target:.4f} USDT. Intentando cerrar posición.")
+                                    exit_price_tp = self._get_best_exit_price('SELL')
+                                    if exit_price_tp:
+                                        self._place_exit_order(price=exit_price_tp, reason="take_profit_pnl_hit")
+                                        return # Terminar ciclo, orden de salida colocada
+                                    else:
+                                        self.logger.error(f"[{self.symbol}] No se pudo obtener precio para colocar orden de Take Profit por PnL.")
+                     # --- Verificación de SALIDA por PnL (Stop Loss / Take Profit) --- END ---
+
                      if self.current_state not in [BotState.PLACING_EXIT, BotState.WAITING_EXIT_FILL, BotState.CANCELING_ORDER]:
-                          self._update_state(BotState.IN_POSITION) # Marcar estado si no estamos saliendo
+                          self._update_state(BotState.IN_POSITION) 
                  else:
                      # Si la API dice que no hay posición, reseteamos estado interno
                      if self.in_position:
-                         self.logger.info(f"[{self.symbol}] La API indica que ya no hay posición abierta. Reseteando estado.")
+                         self.logger.info(f"[{self.symbol}] La API indica que ya no hay posición abierta (pos_qty: {current_pos_qty}). Reseteando estado.")
                          self._reset_state()
-                     self.in_position = False
-                     if self.current_state == BotState.IN_POSITION:
+                     # self.in_position = False # _reset_state() should handle this
+                     if self.current_state == BotState.IN_POSITION: # Ensure state transitions correctly
                            self._update_state(BotState.IDLE)
             else:
                  # Si falla obtener posición, podríamos loguear error pero continuar?
-                 self.logger.error(f"[{self.symbol}] No se pudo obtener información de posición actual.")
-                 # ¿Entrar en ERROR state o asumir no posición?
-                 # Por ahora, asumimos no posición si ya estábamos así, o mantenemos si estábamos IN_POSITION
-                 if not self.in_position and self.current_state != BotState.ERROR:
-                     self._update_state(BotState.IDLE)
-                 elif self.in_position:
-                      self.logger.warning(f"[{self.symbol}] Fallo al obtener datos de posición, pero se asume que sigue activa.")
-                      self._update_state(BotState.IN_POSITION) # Mantener estado
+                 self.logger.error(f"[{self.symbol}] No se pudo obtener información de posición actual (position_info es None).")
+                 # Si el bot pensaba que estaba en posición, pero no podemos confirmarlo, podría ser un problema.
+                 # Por ahora, si no podemos obtener info, no podemos verificar PnL para SL/TP.
+                 # Si self.in_position es True, quizás deberíamos intentar resetear o entrar en error?
+                 if self.in_position:
+                     self.logger.warning(f"[{self.symbol}] El bot cree estar en posición, pero no se pudo obtener info. Manteniendo estado por ahora.")
 
-            # 2.2 Obtener klines y calcular indicadores
+
+            # --- Si hay una orden de salida pendiente (colocada por SL/TP PnL u otra razón), no continuar ---
+            if self.pending_exit_order_id:
+                self.logger.debug(f"[{self.symbol}] Hay una orden de salida pendiente ID {self.pending_exit_order_id}. Saltando el resto de la lógica de entrada/salida.")
+                return
+
+            # 2.2 Obtener klines para RSI y Volumen
             klines = get_historical_klines(self.symbol, self.rsi_interval, limit=self.rsi_period + self.volume_sma_period + 10) # Pedir suficientes klines
             if klines.empty:
                 self.logger.warning(f"[{self.symbol}] No se recibieron datos de klines (DataFrame vacío).")
@@ -737,6 +775,7 @@ class TradingBot:
         self.pending_entry_order_id = None
         self.pending_exit_order_id = None
         self.pending_order_timestamp = None
+        self.current_exit_reason = None # <-- Asegurar que se resetea aquí también
         # ---------------------------------------------------
         # self.last_rsi_value = None # Podríamos mantenerlo o resetearlo
 
@@ -772,6 +811,73 @@ class TradingBot:
         self.current_state = BotState.ERROR
         self.last_error_message = message
         self.logger.error(f"[{self.symbol}] Entering ERROR state: {message}")
+
+    # --- Nuevo método para obtener el mejor precio de salida ---
+    def _get_best_exit_price(self, side: str) -> Decimal | None:
+        """
+        Obtiene el mejor precio disponible del order book para una orden de SALIDA.
+        Para salir de un LONG (SELL), usamos el mejor Bid.
+        Para salir de un SHORT (BUY), usamos el mejor Ask.
+        """
+        ticker = get_order_book_ticker(self.symbol)
+        if not ticker:
+            self.logger.error(f"[{self.symbol}] No se pudo obtener el order book ticker para el precio de salida.")
+            return None
+
+        price_str = None
+        if side == 'SELL': # Cerrando un LONG
+            price_str = ticker.get('bidPrice')
+            price_type = "Bid"
+        elif side == 'BUY': # Cerrando un SHORT (cuando se implemente)
+            price_str = ticker.get('askPrice')
+            price_type = "Ask"
+        else:
+            self.logger.error(f"[{self.symbol}] Lado de orden desconocido '{side}' en _get_best_exit_price.")
+            return None
+
+        if price_str:
+            price = Decimal(price_str)
+            self.logger.info(f"[{self.symbol}] Mejor precio {price_type} obtenido para salida ({side}): {price}")
+            return price
+        else:
+            self.logger.error(f"[{self.symbol}] No se pudo obtener el precio {price_type} del ticker: {ticker}")
+            return None
+    # --- Fin del nuevo método ---
+
+    # --- Nuevo método para colocar una orden de salida ---
+    def _place_exit_order(self, price: Decimal, reason: str):
+        """
+        Coloca una orden LIMIT SELL para cerrar la posición actual.
+        Args:
+            price (Decimal): El precio al cual intentar vender.
+            reason (str): La razón para el cierre (e.g., 'take_profit', 'stop_loss').
+        """
+        if not self.in_position or not self.current_position:
+            self.logger.error(f"[{self.symbol}] Se intentó colocar orden de salida, pero no se está en posición.")
+            return
+
+        self.logger.warning(f"[{self.symbol}] Intentando colocar orden LIMIT SELL para cerrar posición (Razón: {reason})...")
+        self._update_state(BotState.PLACING_EXIT)
+
+        # Usar el precio proporcionado (ya debería ser el mejor bid o ask según el caso)
+        limit_sell_price_adjusted = self._adjust_price(price)
+        quantity_to_sell = self._adjust_quantity(self.current_position['quantity'])
+        
+        self.logger.info(f"[{self.symbol}] Calculado para salida: Precio LIMIT SELL={limit_sell_price_adjusted:.{self.price_tick_size.as_tuple().exponent*-1 if self.price_tick_size else 2}f}, Cantidad={quantity_to_sell}")
+
+        order_result = create_futures_limit_order(self.symbol, 'SELL', quantity_to_sell, limit_sell_price_adjusted)
+
+        if order_result and order_result.get('orderId'):
+            self.pending_exit_order_id = order_result['orderId']
+            self.pending_order_timestamp = time.time()
+            # Guardar la razón de la salida para usarla al registrar en DB si se llena
+            self.current_exit_reason = reason 
+            self.logger.warning(f"[{self.symbol}] Orden LIMIT SELL {self.pending_exit_order_id} colocada @ {limit_sell_price_adjusted:.{self.price_tick_size.as_tuple().exponent*-1 if self.price_tick_size else 2}f}. Esperando ejecución...")
+            self._update_state(BotState.WAITING_EXIT_FILL)
+        else:
+            self.logger.error(f"[{self.symbol}] Fallo al colocar la orden LIMIT SELL para cerrar posición (Razón: {reason}).")
+            self._set_error_state(f"Failed to place exit order (reason: {reason}).")
+    # --- Fin del nuevo método ---
 
 
 # --- Bloque de ejemplo (ya no se usa directamente así) ---

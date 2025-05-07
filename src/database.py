@@ -176,6 +176,48 @@ def record_trade(**kwargs):
             conn.close()
             logger.debug("Conexión SQLite cerrada.")
 
+# --- NUEVA FUNCIÓN PARA PNL ACUMULADO ---
+def get_cumulative_pnl_by_symbol():
+    """Calcula el PnL acumulado para cada símbolo desde la tabla 'trades'."""
+    logger = get_logger()
+    conn = None
+    cumulative_pnl = {} # Diccionario para guardar {symbol: total_pnl}
+
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            logger.error("No se pudo obtener conexión a SQLite DB para calcular PnL acumulado.")
+            return cumulative_pnl # Devuelve vacío si no hay conexión
+
+        # Usar 'with conn:' para manejo automático de la transacción y cierre
+        with conn:
+            cursor = conn.cursor()
+            # Consulta para sumar pnl_usdt agrupado por symbol.
+            # Nos aseguramos de que pnl_usdt no sea NULL para la suma.
+            sql = "SELECT symbol, SUM(IFNULL(pnl_usdt, 0)) FROM trades GROUP BY symbol"
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+            for row in rows:
+                symbol, total_pnl = row
+                if symbol and total_pnl is not None:
+                    cumulative_pnl[symbol] = float(total_pnl) # Convertir a float
+            
+            logger.debug(f"PnL acumulado por símbolo obtenido: {cumulative_pnl}")
+            
+    except sqlite3.Error as e:
+        logger.error(f"Error SQLite al calcular PnL acumulado: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error inesperado al calcular PnL acumulado: {e}", exc_info=True)
+    finally:
+        # 'with conn:' debería cerrar la conexión, pero por si acaso.
+        if conn:
+            conn.close()
+            logger.debug("Conexión SQLite cerrada después de calcular PnL acumulado.")
+            
+    return cumulative_pnl
+# ----------------------------------------
+
 # Ejemplo de uso (actualizado para SQLite)
 if __name__ == '__main__':
     # Es importante llamar a setup_logging antes que a cualquier función que use get_logger
