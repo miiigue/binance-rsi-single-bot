@@ -111,39 +111,45 @@ def config_to_dict(config: configparser.ConfigParser) -> dict:
             the_dict[section][key] = processed_val
     return the_dict
 
-def map_frontend_trading_binance(frontend_data: dict) -> dict:
-    """ Mapea claves de [TRADING] y [BINANCE] (y ahora volumen) """
-    mapping = {
-        # BINANCE
-        'apiKey': ('BINANCE', 'api_key'), 
-        'apiSecret': ('BINANCE', 'api_secret'),
-        'mode': ('BINANCE', 'mode'),
-        # TRADING
-        'rsiInterval': ('TRADING', 'rsi_interval'),
-        'rsiPeriod': ('TRADING', 'rsi_period'),
-        'rsiThresholdUp': ('TRADING', 'rsi_threshold_up'),
-        'rsiThresholdDown': ('TRADING', 'rsi_threshold_down'),
-        'rsiEntryLevelLow': ('TRADING', 'rsi_entry_level_low'),
-        'positionSizeUSDT': ('TRADING', 'position_size_usdt'),
-        'stopLossUSDT': ('TRADING', 'stop_loss_usdt'),
-        'takeProfitUSDT': ('TRADING', 'take_profit_usdt'),
-        'cycleSleepSeconds': ('TRADING', 'cycle_sleep_seconds'),
-        # --- Añadir mapeo de volumen --- 
-        'volumeSmaPeriod': ('TRADING', 'volume_sma_period'),
-        'volumeFactor': ('TRADING', 'volume_factor'),
-        # --- Añadir mapeo para timeout --- 
-        'orderTimeoutSeconds': ('TRADING', 'order_timeout_seconds'),
-        # --------------------------------
+def map_frontend_trading_binance(frontend_data) -> dict:
+    """
+    Mapea los valores del frontend al formato del archivo config.ini.
+    """
+    # Extraer valores y manejar posibles errores
+    result = {
+        'BINANCE': {
+            'API_KEY': str(frontend_data.get('apiKey', '')).strip(),
+            'API_SECRET': str(frontend_data.get('apiSecret', '')).strip(),
+            'TESTNET': str(frontend_data.get('mode', 'paper') == 'paper').lower()
+        },
+        'TRADING': {
+            # RSI y condiciones
+            'RSI_INTERVAL': str(frontend_data.get('rsiInterval', '5m')).strip(),
+            'RSI_PERIOD': str(int(frontend_data.get('rsiPeriod', 14))),
+            'RSI_THRESHOLD_UP': str(float(frontend_data.get('rsiThresholdUp', 1.5))),
+            'RSI_THRESHOLD_DOWN': str(float(frontend_data.get('rsiThresholdDown', -1.0))),
+            'RSI_ENTRY_LEVEL_LOW': str(float(frontend_data.get('rsiEntryLevelLow', 25.0))),
+            
+            # Volumen
+            'VOLUME_SMA_PERIOD': str(int(frontend_data.get('volumeSmaPeriod', 20))),
+            'VOLUME_FACTOR': str(float(frontend_data.get('volumeFactor', 1.5))),
+            
+            # Tendencia - Nuevo parámetro
+            'TREND_PERIOD': str(int(frontend_data.get('trendPeriod', 5))),
+            
+            # Gestión de riesgo
+            'POSITION_SIZE_USDT': str(float(frontend_data.get('positionSizeUSDT', 50.0))),
+            'TAKE_PROFIT_USDT': str(float(frontend_data.get('takeProfitUSDT', 0.0))),
+            'STOP_LOSS_USDT': str(float(frontend_data.get('stopLossUSDT', 0.0))),
+            
+            # Ciclo y control
+            'CYCLE_SLEEP_SECONDS': str(int(frontend_data.get('cycleSleepSeconds', 0))),
+            'ORDER_TIMEOUT_SECONDS': str(int(frontend_data.get('orderTimeoutSeconds', 60))),
+            'BOT_ACTIVE': str(frontend_data.get('active', False)).lower()
+        }
     }
-    ini_data = {}
-    for frontend_key, value in frontend_data.items():
-        if frontend_key in mapping:
-            section, ini_key = mapping[frontend_key]
-            if section not in ini_data:
-                ini_data[section] = {}
-            processed_value = str(value).lower() if isinstance(value, bool) else str(value)
-            ini_data[section][ini_key] = processed_value
-    return ini_data
+    
+    return result
 
 # --- Función run_bot_worker (Movida desde run_bot.py) ---
 # Adaptada para usar las variables globales definidas aquí

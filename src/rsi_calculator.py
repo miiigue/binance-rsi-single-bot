@@ -45,7 +45,10 @@ def calculate_rsi(close_prices: pd.Series, period: int):
         # --- Forma alternativa de llamar a pandas_ta --- 
         # En lugar de close_prices.ta.rsi(...), usamos ta.rsi(close_prices, ...)
         # Esto a veces funciona mejor si el accessor .ta no se registró correctamente.
-        rsi_series = ta.rsi(close=close_prices, length=period, fillna=False)
+
+        # Asegurar que close_prices sea de tipo float para evitar problemas de dtype con pandas-ta
+        close_prices_float = close_prices.astype(float)
+        rsi_series = ta.rsi(close=close_prices_float, length=period, fillna=False)
 
         if rsi_series is None or rsi_series.empty:
              logger.error("pandas_ta.rsi devolvió None o una Serie vacía.")

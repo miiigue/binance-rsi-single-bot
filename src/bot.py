@@ -81,6 +81,8 @@ class TradingBot:
             # --- Leer parámetros de volumen --- 
             self.volume_sma_period = int(self.params.get('volume_sma_period', 20))
             self.volume_factor = float(self.params.get('volume_factor', 1.5))
+            # --- Leer parámetro para detección de tendencia ---
+            self.trend_period = int(self.params.get('trend_period', 5))
             # ----------------------------------
             self.position_size_usdt = Decimal(str(self.params.get('position_size_usdt', '50')))
             self.take_profit_usdt = Decimal(str(self.params.get('take_profit_usdt', '0')))
@@ -100,6 +102,9 @@ class TradingBot:
             if self.volume_factor <= 0:
                  self.logger.warning(f"[{self.symbol}] VOLUME_FACTOR ({self.volume_factor}) debe ser positivo. Usando 1.5.")
                  self.volume_factor = 1.5
+            if self.trend_period <= 0:
+                 self.logger.warning(f"[{self.symbol}] TREND_PERIOD ({self.trend_period}) debe ser positivo. Usando 5.")
+                 self.trend_period = 5
             if self.take_profit_usdt < 0:
                  self.logger.warning(f"[{self.symbol}] TAKE_PROFIT_USDT ({self.take_profit_usdt}) debe ser positivo o cero. Usando 0.")
                  self.take_profit_usdt = Decimal('0')
@@ -253,6 +258,31 @@ class TradingBot:
             self.logger.error(f"[{self.symbol}] Error calculating Volume SMA: {e}", exc_info=True)
             return None
     # --- End of added method ---
+
+    def _is_bearish_trend(self, klines):
+        """
+        Verifica si el mercado está en tendencia bajista comparando precios de cierre.
+        
+        Args:
+            klines (pandas.DataFrame): DataFrame con datos históricos (debe incluir columna 'close')
+            
+        Returns:
+            bool: True si el mercado está en tendencia bajista, False en caso contrario
+        """
+        if len(klines) < self.trend_period:
+            self.logger.warning(f"[{self.symbol}] No hay suficientes datos para verificar tendencia (disponibles: {len(klines)}, necesarios: {self.trend_period})")
+            return False  # Si no hay suficientes datos, asumimos que no hay tendencia bajista
+            
+        # Tomar los últimos N precios de cierre según trend_period
+        trend_prices = klines['close'].iloc[-self.trend_period:].values
+        
+        # Verificar si el primer precio es mayor que el último (tendencia bajista general)
+        is_bearish = trend_prices[0] > trend_prices[-1]
+        
+        # Log para depuración
+        self.logger.debug(f"[{self.symbol}] Verificación de tendencia: Primer precio={trend_prices[0]:.4f}, Último precio={trend_prices[-1]:.4f}, ¿Bajista? {is_bearish}")
+        
+        return is_bearish
 
     def run_once(self):
         """
@@ -532,14 +562,12 @@ class TradingBot:
                      if self.current_state == BotState.IN_POSITION: # Ensure state transitions correctly
                            self._update_state(BotState.IDLE)
             else:
-                 # Si falla obtener posición, podríamos loguear error pero continuar?
-                 self.logger.error(f"[{self.symbol}] No se pudo obtener información de posición actual (position_info es None).")
-                 # Si el bot pensaba que estaba en posición, pero no podemos confirmarlo, podría ser un problema.
-                 # Por ahora, si no podemos obtener info, no podemos verificar PnL para SL/TP.
-                 # Si self.in_position es True, quizás deberíamos intentar resetear o entrar en error?
+                 # Si get_futures_position devuelve None, asumimos que no hay posición abierta.
+                 self.logger.info(f"[{self.symbol}] No se encontró información de posición desde la API (position_info es None), asumiendo no-posición.")
                  if self.in_position:
-                     self.logger.warning(f"[{self.symbol}] El bot cree estar en posición, pero no se pudo obtener info. Manteniendo estado por ahora.")
-
+                     self.logger.warning(f"[{self.symbol}] El bot creía estar en posición, pero la API no retornó datos de posición. Reseteando estado interno.")
+                     self._reset_state() # Esto se encarga de self.in_position = False, self.current_position = None, etc.
+                 # Si no creía estar en posición y no hay datos, no es necesario hacer nada más aquí.
 
             # --- Si hay una orden de salida pendiente (colocada por SL/TP PnL u otra razón), no continuar ---
             if self.pending_exit_order_id:
@@ -645,6 +673,10 @@ class TradingBot:
             # 3.2 Lógica de ENTRADA (Solo si NO estamos en posición y NO hay orden pendiente)
             elif not self.in_position:
                 self._update_state(BotState.CHECKING_CONDITIONS) # Estado: buscando entrada
+                
+                # Verificar si estamos en tendencia bajista
+                is_bearish = self._is_bearish_trend(klines)
+                
                 # Evaluar condiciones de entrada LONG
                 rsi_entry_cond = (rsi_change > self.rsi_threshold_up) and (current_rsi < self.rsi_entry_level_low)
                 volume_cond = False
@@ -657,11 +689,14 @@ class TradingBot:
                      volume_check_log = "Volumen N/A"
                      # Si no hay datos de volumen, ¿permitimos entrada o no?
                      # Por defecto, la haremos más restrictiva: se necesita volumen OK.
-                     volume_cond = False 
+                     volume_cond = False
 
-                # Loguear chequeo de condiciones
-                if rsi_entry_cond and volume_cond:
-                    self.logger.warning(f"[{self.symbol}] CONDICIÓN DE ENTRADA LONG CUMPLIDA (RSI + Volumen). Intentando colocar orden LIMIT BUY...")
+                # Log de condiciones
+                self.logger.info(f"[{self.symbol}] Condiciones de entrada: RSI={rsi_entry_cond}, Volumen={volume_cond}, Tendencia Bajista={is_bearish}")
+                
+                # Loguear chequeo de condiciones - Ahora incluye verificación !is_bearish
+                if rsi_entry_cond and volume_cond and not is_bearish:
+                    self.logger.warning(f"[{self.symbol}] CONDICIÓN DE ENTRADA LONG CUMPLIDA (RSI + Volumen + No Bajista). Intentando colocar orden LIMIT BUY...")
                     self._update_state(BotState.PLACING_ENTRY)
                     
                     # Obtener Bid price para la orden de compra
@@ -743,6 +778,7 @@ class TradingBot:
                 'rsi_threshold_up': self.rsi_threshold_up,
                 'rsi_threshold_down': self.rsi_threshold_down,
                 'rsi_entry_level_low': self.rsi_entry_level_low,
+                'trend_period': self.trend_period,
                 'position_size_usdt': float(self.position_size_usdt),
                 'take_profit_usdt': float(self.take_profit_usdt),
                 'stop_loss_usdt': float(self.stop_loss_usdt)

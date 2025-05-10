@@ -10,6 +10,7 @@ const initialConfig = {
   rsiThresholdUp: 8,
   rsiThresholdDown: -8,
   rsiEntryLevelLow: 25,
+  trendPeriod: 5,
   volumeSmaPeriod: 20,
   volumeFactor: 1.5,
   positionSizeUSDT: 50,
@@ -81,6 +82,7 @@ function ConfigForm() {
           rsiThresholdUp: parseValue(backendConfig.TRADING?.rsi_threshold_up, initialConfig.rsiThresholdUp, 'rsiThresholdUp'),
           rsiThresholdDown: parseValue(backendConfig.TRADING?.rsi_threshold_down, initialConfig.rsiThresholdDown, 'rsiThresholdDown'),
           rsiEntryLevelLow: parseValue(backendConfig.TRADING?.rsi_entry_level_low, initialConfig.rsiEntryLevelLow, 'rsiEntryLevelLow'),
+          trendPeriod: parseValue(backendConfig.TRADING?.trend_period, initialConfig.trendPeriod, 'trendPeriod'),
           volumeSmaPeriod: parseValue(backendConfig.TRADING?.volume_sma_period, initialConfig.volumeSmaPeriod, 'volumeSmaPeriod'),
           volumeFactor: parseValue(backendConfig.TRADING?.volume_factor, initialConfig.volumeFactor, 'volumeFactor'),
           positionSizeUSDT: parseValue(backendConfig.TRADING?.position_size_usdt, initialConfig.positionSizeUSDT, 'positionSizeUSDT'),
@@ -178,6 +180,7 @@ function ConfigForm() {
       rsiThresholdUp: parseValue(config.rsiThresholdUp, initialConfig.rsiThresholdUp, 'rsiThresholdUp'),
       rsiThresholdDown: parseValue(config.rsiThresholdDown, initialConfig.rsiThresholdDown, 'rsiThresholdDown'),
       rsiEntryLevelLow: parseValue(config.rsiEntryLevelLow, initialConfig.rsiEntryLevelLow, 'rsiEntryLevelLow'),
+      trendPeriod: parseValue(config.trendPeriod, initialConfig.trendPeriod, 'trendPeriod'),
       volumeSmaPeriod: parseValue(config.volumeSmaPeriod, initialConfig.volumeSmaPeriod, 'volumeSmaPeriod'),
       volumeFactor: parseValue(config.volumeFactor, initialConfig.volumeFactor, 'volumeFactor'),
       positionSizeUSDT: parseValue(config.positionSizeUSDT, initialConfig.positionSizeUSDT, 'positionSizeUSDT'),
@@ -389,10 +392,29 @@ function ConfigForm() {
                   value={config.rsiEntryLevelLow}
                   onChange={handleChange}
                   className={inputClass}
+                  min="1"
+                  max="99"
                   step="0.1"
-                  placeholder="e.g., 25"
+                  placeholder="Ej: 25"
                 />
-                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Entrar si RSI está bajo este valor (y cambio RSI OK).</p>
+                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">RSI actual debe estar por debajo de este nivel.</p>
+              </div>
+              <div>
+                <label htmlFor="trendPeriod" className={labelClass}>
+                  Periodo Tendencia
+                </label>
+                <input
+                  type="number"
+                  name="trendPeriod"
+                  id="trendPeriod"
+                  value={config.trendPeriod}
+                  onChange={handleChange}
+                  className={inputNumberClass}
+                  min="1"
+                  step="1"
+                  placeholder="Ej: 5"
+                />
+                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Velas para detectar tendencia bajista.</p>
               </div>
               <div>
                 <label htmlFor="volumeSmaPeriod" className={labelClass}>
